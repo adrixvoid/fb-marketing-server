@@ -1,0 +1,4 @@
+.atl/
+.DS_Store
+dist/
+node_modules/

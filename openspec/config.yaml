@@ -1,0 +1,75 @@
+schema: spec-driven
+
+artifact_store:
+  mode: hybrid
+
+execution:
+  mode: auto
+  delivery_strategy: single-pr-default
+  review_budget_lines: 400
+
+context: |
+  Stage: Runnable contract-first Node.js service scaffold with installed project dependencies.
+  Contract: OpenAPI 3.1.1 in openapi.yaml is the canonical machine boundary.
+  Target stack: Node.js 24 LTS, TypeScript, Fastify, openapi-backend, and node:sqlite.
+  Architecture: Private loopback-only macOS service used solely by OpenClaw for Meta Marketing API v26.0.
+  Security: Every scope is explicit; reads are authorized; mutations require deterministic owner approval outside the LLM.
+  Documentation: docs/*.md defines requirements, target architecture, technology decisions, operations, and remote access.
+
+strict_tdd: true
+
+testing:
+  detected: 2026-08-19
+  runner:
+    available: true
+    framework: node:test
+    command: npm test
+  layers:
+    unit: true
+    integration: true
+    e2e: false
+  coverage:
+    available: false
+    command: ""
+  quality:
+    linter:
+      available: false
+      command: ""
+    type_checker:
+      available: true
+      command: npm run typecheck
+    formatter:
+      available: false
+      command: ""
+  reason: Node 24, TypeScript, node:test, and Fastify.inject integration checks are configured and passing. Strict TDD defaults on under sdd-init policy now that a test runner exists.
+
+rules:
+  proposal:
+    - Preserve openapi.yaml and docs/*.md unless a change explicitly includes them.
+    - Separate documented target technology from currently installed dependencies.
+    - Include a rollback plan for risky changes.
+  specs:
+    - Use Given/When/Then for scenarios.
+    - Use RFC 2119 keywords for normative requirements.
+    - Trace behavior to the canonical requirements and OpenAPI contract where applicable.
+  design:
+    - Follow the documented trust boundaries and explicit client/ad-account scoping.
+    - Document security-sensitive decisions and rationale.
+  tasks:
+    - Group work by phase and use hierarchical numbering.
+    - Keep tasks reviewable within the 400-line default review budget when practical.
+  apply:
+    tdd: true
+    test_command: npm test
+    notes:
+      - Follow existing code patterns once a scaffold exists.
+      - Do not claim target dependencies are installed until package metadata proves it.
+      - Add the smallest runnable check with each non-trivial implementation.
+  verify:
+    test_command: npm test
+    build_command: npm run build
+    coverage_threshold: 0
+    notes:
+      - Report unavailable checks rather than treating them as passed.
+  archive:
+    - Warn before merging destructive deltas.
