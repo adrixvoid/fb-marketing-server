@@ -1,116 +1,118 @@
-# Use fb-marketing-server with OpenClaw locally
+# Set up fb-marketing-server with OpenClaw on one Mac
 
-This integration is **not an MCP server**. It is an OpenClaw `2026.9.2` native plugin that registers nine scope-aware model tools and two deterministic owner-only commands. The plugin calls the Fastify API over `http://127.0.0.1:3000`; neither API is intended for public or production deployment.
+This guide sets up the local server and its OpenClaw `2026.9.2` plugin. The server listens only on `http://127.0.0.1:3000`; people use it through configured OpenClaw outbound chat channels, not through a public API.
 
-## 1. Architecture and trust boundary
+This is not an MCP server and is not a production deployment.
 
-```text
-trusted chat channel
-  |  inbound message/attachment context
-  v
-OpenClaw 2026.9.2 Gateway
-  |-- model dispatch: nine registered tools
-  |-- command dispatch: /approve-ad and /reject-ad (owner only)
-  |
-  |  HTTP + service bearer, loopback only
-  v
-fb-marketing-server (Fastify on 127.0.0.1:3000)
-  |-- SQLite state and private staged media
-  |-- macOS Keychain secret provider
-  `-- Meta Graph/Marketing API v26.0 (outbound only when a tool needs Meta)
-```
+## Before you start
 
-The trust boundary is the local Mac user session. OpenClaw receives chat identity and attachments, but the model never receives the service bearer, owner-proof key, Meta token, App Secret, local attachment path, or approval capability. The plugin rejects non-loopback base URLs, redirects, oversized responses, and responses with the wrong request correlation ID.
+You need:
 
-## 2. Prerequisites
+- macOS, with the login Keychain unlocked.
+- Node.js `24.19.0` and npm `11.17.0`.
+- OpenClaw `2026.9.2`, already connected to your Telegram bot.
+- Your numeric Telegram user ID. Use the number from the bot's pairing reply, or run `openclaw pairing list telegram`. Do not use a username, phone number, chat ID, group ID, or bot ID.
+- The absolute path to the directory where OpenClaw stores trusted inbound Telegram attachments.
 
-- macOS with an unlocked login Keychain for the same user that runs both processes.
-- Node.js `24.19.0`, pinned by `.nvmrc` and `package.json`.
-- npm `11.17.0`, pinned by `package.json`.
-- OpenClaw `2026.9.2`. The plugin package and lockfile pin this exact peer/dev version.
-- A trusted OpenClaw channel with one known owner identity in exact `<channel>:<user_id>` form.
+Replace every value inside angle brackets before running a command:
 
-From the repository root:
+| Placeholder | Example | Meaning |
+|---|---|---|
+| `<repo>` | `/Users/you/Sites/fb-server` | This repository's absolute path. |
+| `<numeric_user_id>` | `123456789` | Your numeric Telegram user ID. |
+| `<attachment-root>` | `/Users/you/.openclaw/media/inbound` | A narrow, trusted inbound-attachment directory. Do not use your home directory. |
+| `<client_id>` | `client-acme` | Internal client ID, available only after Meta provisioning. |
+| `<ad_account_id>` | `act_123456789` | Exact Meta Ad Account ID, available only after Meta provisioning. |
+
+## Setup
+
+### 1. Open the repository and verify prerequisites
+
+Open Terminal, then run:
 
 ```bash
+cd "<repo>"
 nvm install
 nvm use
 npm install --global npm@11.17.0
-node --version # v24.19.0
-npm --version  # 11.17.0
-openclaw --version # OpenClaw 2026.9.2
+node --version
+npm --version
+openclaw --version
+```
+
+Expected results:
+
+```text
+v24.19.0
+11.17.0
+OpenClaw 2026.9.2
+```
+
+Stop here if any version differs. Fix that prerequisite before continuing.
+
+### 2. Install dependencies and build the server
+
+Run from `<repo>`:
+
+```bash
 npm ci
 npm run build
 ```
 
-## 3. Configure Keychain records
+Expected result: both commands finish without an error, and `<repo>/dist/src/server.js` exists.
 
-All runtime records use Keychain service `fb-marketing-server`.
+No `.env` file is required. Do not put secrets in `.env`. The only optional environment setting is `PORT`; it defaults to `3000`. `HOST` cannot be changed and is always `127.0.0.1`.
 
-| Account | Content | Created by | Used by |
-|---|---|---|---|
-| `openclaw-service-token` | Random bearer shared by the plugin and local Fastify service | Operator, before first start | Server and plugin |
-| `openclaw-owner-identity` | Exact non-secret `<channel>:<user_id>` owner identity | Operator, before first start | Server approval validation |
-| `owner-proof-hmac-key` | Random 32-byte base64 HMAC key | Server automatically on first start | Server and deterministic plugin commands |
-| `cursor-hmac-key` | Random 32-byte base64 cursor key | Server automatically on first start | Server only |
-| `<credential-key-ref>` | Random 32-byte base64 AES key for a scoped Meta credential envelope | Trusted out-of-band provisioning | Server only |
+Use the default port for this guide. If port `3000` is already occupied, you may later start with `PORT=3001 npm start`, but you must also replace `3000` with `3001` in the health URL and plugin `baseUrl`. The optional LaunchAgent uses the default port.
 
-Create or rotate the service bearer without placing it in argv, shell history, or a file:
+### 3. Create the two required Keychain records
+
+All records use Keychain service `fb-marketing-server`.
+
+Create or rotate the local service token:
 
 ```bash
 openssl rand -base64 32 | /usr/bin/security add-generic-password -U \
   -s fb-marketing-server -a openclaw-service-token -w
 ```
 
-Enter the owner identity through a private prompt. Replace the prompt input with the exact identity reported by the configured channel, such as `discord:<user_id>`; do not use a bare user ID.
+Expected result: the command returns to the prompt without printing the token.
+
+Store the owner identity. At the prompt, enter only your numeric Telegram user ID; the command adds the required `telegram:` prefix:
 
 ```bash
-read -r -s "OWNER_IDENTITY?Owner identity (<channel>:<user_id>): "
-printf '\n'
-printf '%s\n' "$OWNER_IDENTITY" | /usr/bin/security add-generic-password -U \
-  -s fb-marketing-server -a openclaw-owner-identity -w
-unset OWNER_IDENTITY
+printf 'Telegram numeric user ID: '
+IFS= read -r TELEGRAM_USER_ID
+printf 'telegram:%s\n' "$TELEGRAM_USER_ID" | \
+  /usr/bin/security add-generic-password -U \
+    -s fb-marketing-server -a openclaw-owner-identity -w
+unset TELEGRAM_USER_ID
 ```
 
-Meta credentials are separate from those records. The access token and App Secret are encrypted together as `{"accessToken": ..., "appSecret": ...}` in SQLite; only the envelope key named by `encrypted_credentials.key_ref` belongs in Keychain. Do not add either Meta value as a command argument, environment export, prompt, log line, or plaintext database value.
+Expected result: Keychain contains these accounts under service `fb-marketing-server`:
 
-## 4. Configure one client/account scope
+```text
+openclaw-service-token
+openclaw-owner-identity = telegram:<numeric_user_id>
+```
 
-The only runtime environment setting is optional `PORT`; it defaults to `3000` and must be `1` through `65535`. `HOST` is intentionally not configurable. Production-style startup reads the service bearer and owner identity from Keychain rather than `OPENCLAW_SERVICE_TOKEN` or `OPENCLAW_OWNER_IDENTITY` in the process environment.
+The owner identity is not a secret, but it must exactly match OpenClaw's Telegram sender identity. The server creates `owner-proof-hmac-key` and `cursor-hmac-key` automatically on first start.
 
-The SQLite database starts with schema only. A usable scope requires one coherent, validated record chain:
+### 4. Start the server in the foreground
 
-| Record | Required state |
-|---|---|
-| `clients` | Internal `<client_id>`, client name, portfolio ID, `active = 1` |
-| `ad_accounts` | Exact `<ad_account_id>` owned by that client, name, currency, timezone, `active = 1` |
-| `integrations` | Meta App ID, `state = 'active'`, `active = 1` |
-| `integration_generations` | Active generation with non-null `validated_at` and null `retired_at` |
-| `scope_mappings` | Exact client/account/generation pair, `active = 1`; all four authority flags set only after validation; required Meta tasks in `granted_tasks` |
-| `encrypted_credentials` | Active encrypted access-token/App-Secret envelope for that generation, non-null `validated_at`, null `revoked_at`, actual permissions in `scopes`, and a Keychain `key_ref` |
-
-Reads require `ads_read`. Mutations additionally require the `ADVERTISE` task and `ads_management`; capabilities can report further asset-specific gaps.
-
-> **Provisioning boundary:** this repository currently has no supported command that creates these records or encrypts a real Meta credential. Provision and validate them through trusted operator work outside the model-facing API, following [Meta setup, pilot, and migration](meta-setup.md). Do not copy test fixture SQL into the live database. Until this is done, health can pass and the plugin can load, but `/v1/scopes` is empty and Meta-backed tools report configuration or scope errors.
-
-Keep these placeholders distinct:
-
-- `<client_id>`: your internal stable client identifier.
-- `<ad_account_id>`: the exact Meta Ad Account identifier mapped to that client.
-- `<channel>:<user_id>`: the single OpenClaw owner identity.
-- `<attachment-root>`: an absolute directory used by OpenClaw for trusted inbound attachment files.
-- `<credential-key-ref>`: the Keychain account selected by the trusted credential-provisioning process.
-
-## 5. Start manually and verify health
-
-Start in the foreground first so startup and Keychain errors are visible:
+Run from `<repo>`:
 
 ```bash
-npm run build
 npm start
 ```
 
-In another terminal, stream the bearer from Keychain into curl configuration on stdin. It is not exported or placed in curl argv:
+Expected result: the process stays running without a startup error. Leave this Terminal window open so errors remain visible.
+
+Safe stop point: press `Ctrl-C` at any time. To continue later, return to `<repo>` and run `npm start` again.
+
+### 5. Verify server health
+
+Open a second Terminal window and run this command. It streams the token from Keychain to `curl` without placing the token in shell history, an environment export, or `curl` arguments:
 
 ```bash
 /usr/bin/security find-generic-password \
@@ -122,20 +124,37 @@ In another terminal, stream the bearer from Keychain into curl configuration on 
   --url http://127.0.0.1:3000/health
 ```
 
-Expected shape:
+Expected result:
 
 ```json
 {"status":"ok","time":"<ISO-8601 timestamp>"}
 ```
 
-Stop the foreground process with `Ctrl-C` after this check.
+Keep the server running for the remaining verification. If health fails, stop here and fix the displayed server or Keychain error.
 
-## 6. Build, pack, install, and configure the plugin
+### 6. Note the current Meta provisioning stop point
 
-Use OpenClaw's managed `npm-pack:` path for the production-like local install. It validates the tarball through npm package semantics. Use `--link` only while developing the checkout.
+The repository currently has **no supported live provisioning CLI** for creating a client/account scope or encrypting a real Meta credential. Do not copy test fixture SQL into the live database.
+
+Until trusted operator provisioning is completed:
+
+- Server health can pass.
+- The plugin can install and load.
+- `list_scopes` returns an empty list.
+- Meta-backed tools report configuration or scope errors.
+
+Provisioning must create and validate the client, ad account, integration generation, scope mapping, authority flags, granted tasks, permissions, and encrypted credential described in [Meta setup, pilot, and migration](meta-setup.md).
+
+The Meta access token and App Secret are encrypted together in SQLite. SQLite stores only ciphertext, IV, authentication tag, and the Keychain account reference. Only the random 32-byte envelope key belongs in Keychain. Never put the Meta token or App Secret in command arguments, shell history, `.env`, logs, Git, model prompts, or plaintext SQLite.
+
+Safe stop point: if you only need to prove the local server works, stop it with `Ctrl-C`. Meta-backed verification cannot continue until provisioning is available and completed.
+
+### 7. Build and install the OpenClaw plugin
+
+In the second Terminal, run:
 
 ```bash
-cd packages/openclaw-plugin
+cd "<repo>/packages/openclaw-plugin"
 npm ci
 npm run build
 mkdir -p "$HOME/Library/Application Support/fb-marketing-server/plugin-pack"
@@ -144,66 +163,67 @@ openclaw plugins install \
   "npm-pack:$HOME/Library/Application Support/fb-marketing-server/plugin-pack/fb-marketing-server-openclaw-plugin-0.1.0.tgz"
 ```
 
-Development-only alternative from the repository root:
+Expected result: npm creates `fb-marketing-server-openclaw-plugin-0.1.0.tgz`, and OpenClaw reports that plugin `fb-marketing-server` was installed. Review and accept OpenClaw's local-plugin warning only if `<repo>` is the checkout you intend to trust.
 
-```bash
-openclaw plugins install --link ./packages/openclaw-plugin --force
-```
+### 8. Configure the plugin and authorize the owner
 
-Set the manifest's exact strict fields. No other plugin config keys are accepted. Replace only `<attachment-root>` with an absolute trusted OpenClaw inbound-media directory; do not grant a broad directory such as your home folder.
+Replace `<attachment-root>` and `<numeric_user_id>`, then run:
 
 ```bash
 openclaw config set plugins.entries.fb-marketing-server.config \
   '{"baseUrl":"http://127.0.0.1:3000","keychainService":"fb-marketing-server","serviceTokenAccount":"openclaw-service-token","ownerProofAccount":"owner-proof-hmac-key","attachmentRoots":["<attachment-root>"],"timeoutMs":10000}' \
   --strict-json
-```
-
-Authorize exactly one owner, using the same value stored as `openclaw-owner-identity`:
-
-```bash
 openclaw config set commands.ownerAllowFrom \
-  '["<channel>:<user_id>"]' --strict-json
+  '["telegram:<numeric_user_id>"]' --strict-json
 openclaw plugins enable fb-marketing-server
 openclaw gateway restart
 ```
 
-The configuration contains Keychain references, not secrets. The restart is required after plugin or configuration changes.
+Expected result: each command succeeds, the plugin is enabled, and the Gateway restarts. The value `telegram:<numeric_user_id>` must be identical here and in Keychain account `openclaw-owner-identity`.
 
-## 7. Verify tools and owner commands
+These commands configure owner-only plugin commands; they do not replace your existing Telegram channel setup. The plugin configuration contains Keychain account names, not secret values.
 
-Inspect the installed runtime:
+### 9. Verify the plugin
+
+Run:
 
 ```bash
 openclaw plugins inspect fb-marketing-server --runtime --json
 openclaw plugins list --enabled --json
 ```
 
-The plugin registers exactly these nine model tools:
+Expected result: `fb-marketing-server` is installed, enabled, and loaded from built `dist/index.js`. Its runtime registers these nine tools:
 
-| Tool | Scope behavior |
-|---|---|
-| `list_scopes` | Lists only authorized client/account pairs; no input scope |
-| `integration_status` | Accepts no scope or an explicit pair |
-| `get_capabilities` | Requires `client_id` and `ad_account_id` |
-| `list_campaigns` | Requires `client_id` and `ad_account_id` |
-| `query_insights` | Requires `client_id` and `ad_account_id` |
-| `budget_summary` | Requires an explicit pair, or deliberate `global: true` composition |
-| `upload_chat_media` | Requires an explicit pair and trusted inbound attachment context |
-| `propose_operation` | Requires an explicit pair and creates only a pending proposal |
-| `get_operation` | Requires an explicit pair and operation UUID |
+```text
+list_scopes
+integration_status
+get_capabilities
+list_campaigns
+query_insights
+budget_summary
+upload_chat_media
+propose_operation
+get_operation
+```
 
-It also registers exactly two deterministic commands outside model dispatch:
+It also registers two owner-only commands:
 
 ```text
 /approve-ad <operation_id>
 /reject-ad <operation_id>
 ```
 
-Safe conversation checks, after replacing both placeholders with an authorized pair:
+In your authorized Telegram chat, send:
 
 ```text
-List the authorized scopes. Then show integration status for client_id
-<client_id> and ad_account_id <ad_account_id>. Do not infer either ID.
+List the authorized scopes. Do not infer any client or ad account ID.
+```
+
+Expected result before Meta provisioning: an empty scope list, not invented IDs. After provisioning, use the returned IDs for checks such as:
+
+```text
+Show integration status for client_id <client_id> and ad_account_id
+<ad_account_id>. Do not infer either ID.
 ```
 
 ```text
@@ -211,79 +231,55 @@ List PAUSED campaigns for client_id <client_id> and ad_account_id
 <ad_account_id>. Do not propose or execute a mutation.
 ```
 
-```text
-Prepare, but do not approve, a monthly budget operation for client_id
-<client_id> and ad_account_id <ad_account_id>. Show the immutable operation ID,
-payload, expiry, and next action.
-```
+Never use natural-language agreement as approval. A mutation starts as an immutable pending proposal and executes only after the configured owner sends `/approve-ad <operation_id>`. New Campaign, Ad Set, and Ad objects are created `PAUSED`; activation requires a separate proposal and approval.
 
-Mutation flow is fixed: the model calls `propose_operation`, the service persists an immutable pending operation, the owner sends `/approve-ad <operation_id>` or `/reject-ad <operation_id>`, and only approval can execute. Natural-language agreement is not approval. New Campaign, Ad Set, and Ad objects are created `PAUSED`; Creative is bound without delivery status. Activation requires a separate proposal and owner approval.
+### 10. Optionally keep the server running with a LaunchAgent
 
-## 8. Attach media from trusted chat
+Do this only after foreground health and plugin verification succeed.
 
-1. Attach exactly one fresh JPEG, PNG, or MP4 to the trusted OpenClaw chat message.
-2. In that same sender/conversation context, ask OpenClaw to stage it for explicit `<client_id>` and `<ad_account_id>`.
-3. OpenClaw supplies the trusted attachment context to the plugin. The model supplies neither a local path nor a URL.
-4. `upload_chat_media` validates the attachment beneath `attachmentRoots`, sends multipart bytes over loopback, and returns an opaque `media_id` plus hash for a later proposal.
+First return to the Terminal running `npm start` and press `Ctrl-C`. This prevents two server processes from competing for port `3000`.
 
-The inbound attachment claim expires after five minutes and must resolve to exactly one file. Server staging expires within 12 hours or earlier when the linked operation completes or expires.
-
-## 9. Optional local LaunchAgent persistence
-
-This is local service persistence for the logged-in Mac user, not production deployment. Run it only after foreground startup and health succeed.
+Then run from `<repo>`:
 
 ```bash
+cd "<repo>"
 npm run service:install
 npm run service:status
 ```
 
-The installer builds, writes `~/Library/LaunchAgents/com.gentleman-programming.fb-marketing-server.plist`, and starts the user job. Logs are in `~/Library/Logs/fb-marketing-server/`.
+Expected result: the status command shows the loaded user job `com.gentleman-programming.fb-marketing-server`. The installer builds the server, writes `~/Library/LaunchAgents/com.gentleman-programming.fb-marketing-server.plist`, and writes private logs under `~/Library/Logs/fb-marketing-server/`.
 
-There is no separate root `service:stop` script. To stop the persisted service and remove only its plist, use:
+Safe stop point: remove only the LaunchAgent and stop its process with:
 
 ```bash
 npm run service:uninstall
 ```
 
-Reinstall with `npm run service:install`. Application data and Keychain records are preserved.
+Application data and Keychain records remain in place. Reinstall later with `npm run service:install`.
 
-## 10. Troubleshooting
+## Trusted Telegram attachments
+
+After Meta provisioning, attach exactly one fresh JPEG, PNG, or MP4 and ask OpenClaw to stage it for an explicit `<client_id>` and `<ad_account_id>` in the same message. The model must not supply a local path or URL. The attachment claim expires after five minutes and must resolve beneath the configured `<attachment-root>` to exactly one non-symlink file.
+
+## Troubleshooting
 
 | Symptom | Safe next action |
 |---|---|
-| Plugin not loaded | Run `openclaw plugins inspect fb-marketing-server --runtime --json`; confirm ID `fb-marketing-server`, exact OpenClaw `2026.9.2`, enabled state, built `dist/index.js`, and all required config fields; then restart the Gateway. |
-| Owner command says unauthorized | Confirm the channel's exact sender ID, then make the single `commands.ownerAllowFrom` entry and Keychain `openclaw-owner-identity` identical `<channel>:<user_id>` values. A bare ID and multiple owners fail closed. |
-| `Keychain access failed` or secret unavailable | Run both processes as the same logged-in macOS user, unlock the login Keychain, and confirm the required account exists using Keychain Access without revealing its value. Never move it to `.env` or plugin config. |
-| Empty scopes or client/account mismatch | Complete out-of-band provisioning; verify the exact pair, active/validated generation and credential, authority flags, tasks, and scopes. Retry only with the explicit authorized pair returned by `list_scopes`. |
-| Capability unavailable | Call `get_capabilities` for the exact pair and follow its diagnostic codes. Correct Meta permission, task, partner/asset assignment, or incompatible Page/pixel/form/Instagram selection before proposing. |
-| Media unavailable | Send one new attachment in the same trusted channel, sender, account, and conversation; retry within five minutes. Confirm its real path is beneath a narrow `attachmentRoots` entry and is not a symlink. |
-| Proposal rejected as invalid | Correct the typed payload and use a new 16-128 character idempotency key only when the intended payload changes. Never turn chat consent into approval. |
-| Meta write is ambiguous or reconciliation is required | Do not approve again and do not automatically retry. Read the operation with `get_operation`, inspect the local audit/log evidence by `request_id`, reconcile the external Meta object state manually, and create a new proposal only after proving another write cannot duplicate the first. |
+| Wrong Node, npm, or OpenClaw version | Return to step 1. Do not continue with a different version. |
+| `Keychain access failed` | Use the same logged-in macOS user for the server and OpenClaw, unlock the login Keychain, and confirm both required accounts exist in Keychain Access. Do not move values to `.env`. |
+| `EADDRINUSE` | Stop the other process on port `3000`, especially a previously installed LaunchAgent. Use another `PORT` only if you also update the health URL and plugin `baseUrl`. |
+| Plugin not loaded | Run `openclaw plugins inspect fb-marketing-server --runtime --json`; confirm version `2026.9.2`, enabled state, built `dist/index.js`, and the exact configuration fields, then restart the Gateway. |
+| Owner command says unauthorized | Confirm the Telegram numeric sender ID. Make Keychain `openclaw-owner-identity` and `commands.ownerAllowFrom` exactly `telegram:<numeric_user_id>`. A bare number, username, or multiple owners fails closed. |
+| Empty scopes | This is expected before trusted Meta provisioning. There is currently no supported live provisioning CLI. |
+| Capability unavailable | After provisioning, call `get_capabilities` for the exact pair and follow its diagnostic codes. Do not guess another account or credential. |
+| Ambiguous Meta write | Do not approve again or automatically retry. Read the operation, reconcile Meta state manually, and create a new proposal only after proving it cannot duplicate the first write. |
 
-## 11. Security and non-goals
+## Security rules
 
-- Keep both OpenClaw and Fastify APIs on loopback. Do not add a public API, reverse proxy, tunnel, port forward, or webhook exposure.
-- This integration is not MCP and does not expose MCP transport or tools.
-- Never put service tokens, Meta access tokens, App Secrets, Keychain values, authorization headers, or owner proofs in prompts, logs, config JSON, shell argv, or Git.
-- Never let the model choose or infer `client_id`, `ad_account_id`, attachment paths, approval identity, or a replacement credential.
-- Never automatically retry an ambiguous Meta write. Reconciliation is operator work.
-- One local account does not require the 14-app pilot or migration program. Real pilot, cutover, observation, rollback exercises, and migration remain optional operator work when expanding beyond this local use case.
+- Keep the Fastify service and OpenClaw Gateway on loopback. Do not add a public API, proxy, tunnel, port forward, or webhook exposure.
+- Never put service tokens, Meta access tokens, App Secrets, Keychain values, authorization headers, or owner proofs in command arguments, shell history, `.env`, logs, Git, model prompts, or plaintext SQLite.
+- Never let the model choose or infer a client ID, ad account ID, attachment path, approval identity, or replacement credential.
+- Never automatically retry an ambiguous Meta write.
+- Use Keychain service `fb-marketing-server`. Meta token and App Secret ciphertext belong in SQLite; only the envelope key belongs in Keychain.
 
-For contract-level details, see [`openapi.yaml`](../openapi.yaml). For optional broader Meta provisioning and migration, see [`meta-setup.md`](meta-setup.md).
-
-## 12. Files and directories created after setup
-
-| Path | Purpose |
-|---|---|
-| `<repo>/node_modules/` | Root project dependencies. |
-| `<repo>/dist/` | Compiled local gateway. |
-| `<repo>/packages/openclaw-plugin/node_modules/` | Plugin dependencies. |
-| `<repo>/packages/openclaw-plugin/dist/` | Compiled OpenClaw plugin. |
-| `~/Library/Application Support/fb-marketing-server/state.sqlite` | Local SQLite state. |
-| `~/Library/Application Support/fb-marketing-server/media/` | Private staged chat media. |
-| `~/Library/Application Support/fb-marketing-server/plugin-pack/` | Locally packed plugin archive. |
-| `~/Library/Logs/fb-marketing-server/` | Private `stdout.log` and `stderr.log` files. |
-| `~/Library/LaunchAgents/com.gentleman-programming.fb-marketing-server.plist` | Optional per-user automatic startup configuration. |
-| `~/.openclaw/npm/projects/` | OpenClaw-managed plugin installation. |
-
-The related secrets are stored as Keychain records under service `fb-marketing-server`; they are not files in these directories.
+For contract details, see [`openapi.yaml`](../openapi.yaml). For provisioning and migration requirements, see [Meta setup, pilot, and migration](meta-setup.md). For backup, restore, rotation, and private operations, see [Secure remote access](remote-access.md).
