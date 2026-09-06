@@ -1,0 +1,22 @@
+{
+  "agency_business_id": "3981018332186282",
+  "pilot_business_id": "290166249089842",
+  "target_generation": "generation-central-15",
+  "apps": [
+    { "integration_id": "old-01", "app_id": "app-01", "client_id": "client-pilot", "business_id": "290166249089842", "ad_account_ids": ["act_pilot_a", "act_pilot_b"], "target_generation": "generation-central-15" },
+    { "integration_id": "old-02", "app_id": "app-02", "client_id": "client-five", "business_id": "business-five", "ad_account_ids": ["act_five"], "target_generation": "generation-central-15" },
+    { "integration_id": "old-03", "app_id": "app-03", "client_id": "client-five", "business_id": "business-five", "ad_account_ids": ["act_five"], "target_generation": "generation-central-15" },
+    { "integration_id": "old-04", "app_id": "app-04", "client_id": "client-five", "business_id": "business-five", "ad_account_ids": ["act_five"], "target_generation": "generation-central-15" },
+    { "integration_id": "old-05", "app_id": "app-05", "client_id": "client-five", "business_id": "business-five", "ad_account_ids": ["act_five"], "target_generation": "generation-central-15" },
+    { "integration_id": "old-06", "app_id": "app-06", "client_id": "client-five", "business_id": "business-five", "ad_account_ids": ["act_five"], "target_generation": "generation-central-15" },
+    { "integration_id": "old-07", "app_id": "app-07", "client_id": "client-03", "business_id": "business-03", "ad_account_ids": ["act_03"], "target_generation": "generation-central-15" },
+    { "integration_id": "old-08", "app_id": "app-08", "client_id": "client-04", "business_id": "business-04", "ad_account_ids": ["act_04"], "target_generation": "generation-central-15" },
+    { "integration_id": "old-09", "app_id": "app-09", "client_id": "client-05", "business_id": "business-05", "ad_account_ids": ["act_05"], "target_generation": "generation-central-15" },
+    { "integration_id": "old-10", "app_id": "app-10", "client_id": "client-06", "business_id": "business-06", "ad_account_ids": ["act_06"], "target_generation": "generation-central-15" },
+    { "integration_id": "old-11", "app_id": "app-11", "client_id": "client-07", "business_id": "business-07", "ad_account_ids": ["act_07"], "target_generation": "generation-central-15" },
+    { "integration_id": "old-12", "app_id": "app-12", "client_id": "client-08", "business_id": "business-08", "ad_account_ids": ["act_08"], "target_generation": "generation-central-15" },
+    { "integration_id": "old-13", "app_id": "app-13", "client_id": "client-09", "business_id": "business-09", "ad_account_ids": ["act_09"], "target_generation": "generation-central-15" },
+    { "integration_id": "old-14", "app_id": "app-14", "client_id": "client-10", "business_id": "business-10", "ad_account_ids": ["act_10"], "target_generation": "generation-central-15" }
+  ],
+  "batches": ["client-pilot", "client-five", "client-03", "client-04", "client-05", "client-06", "client-07", "client-08", "client-09", "client-10"]
+}

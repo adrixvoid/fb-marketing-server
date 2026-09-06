@@ -10,7 +10,7 @@
 |---|---|
 | Deployment | Run the Node.js server on macOS as a `launchd` LaunchAgent started at user login. |
 | Network | Bind `fb-marketing-server` to `127.0.0.1`. OpenClaw is the only local caller and authenticates with a dedicated internal service token. |
-| Remote access | Reach OpenClaw through Tailscale Serve or an SSH tunnel. Never expose `fb-marketing-server` publicly. |
+| Remote access | Users interact through configured OpenClaw outbound chat channels. Network administration is limited to authenticated shell access to the Mac. |
 | Meta model | Target one agency-owned Meta Business App and one agency System User as a project choice, not a Meta mandate, while preserving all 14 existing Developer Apps until migrations are proven. |
 | Client ownership | Each legally distinct client Business Portfolio retains its Business Assets. Clients grant the agency portfolio partner access only to required assets and tasks. |
 | Reads | Read-only metrics and diagnostics may execute without approval after client and ad account resolution. |
@@ -37,7 +37,7 @@ Node.js fb-marketing-server (127.0.0.1)
 Meta Marketing API
 ```
 
-Remote users connect to OpenClaw through Tailscale Serve or an SSH tunnel. The detailed network controls and verification steps live in [Secure remote access](remote-access.md).
+Remote users interact through configured OpenClaw outbound chat channels. The local service is not a user-access boundary. Operational controls live in [Private operation and outbound chat access](remote-access.md).
 
 ## Trust boundaries
 
@@ -47,7 +47,7 @@ Remote users connect to OpenClaw through Tailscale Serve or an SSH tunnel. The d
 | OpenClaw to `fb-marketing-server` | Accept only loopback HTTP requests carrying the dedicated internal service token. Keep this token in protected plugin/runtime configuration, unavailable to the model and separate from Meta credentials. |
 | `fb-marketing-server` to Meta | Select a credential explicitly authorized for the resolved client, asset, and endpoint. |
 | Process to local storage | Keep the encryption key in macOS Keychain; never store it in SQLite, source control, logs, or AI context. |
-| Remote network | Terminate remote access at OpenClaw. Do not use a public reverse proxy, port forwarding, or Tailscale Funnel for `fb-marketing-server`. |
+| Remote network | User access terminates at an allowlisted OpenClaw outbound chat channel; both local APIs remain loopback-only. |
 
 ## Meta concepts
 
@@ -96,12 +96,12 @@ FR-1 through FR-3 define canonical request resolution and labeling. `/v1/scopes`
 |---|---|
 | Read metrics or diagnostics | Execute directly after authorization and explicit scope resolution when scoped. Valid Insights with no data return `200` with an empty page; `422` means a semantically unsupported query or metric. Diagnosed Meta integration states return `200`; `403` is local caller authorization failure. |
 | Discover scoped capabilities | Resolve both IDs, page one deterministic typed asset collection, repeat safe context on every page, return null currency/timezone only with actionable gaps, and audit Meta validation calls. This is read-only discovery: it neither creates an operation nor grants approval. |
-| Ingest creative media | Accept only host-trusted inbound attachment bytes and metadata from supported public OpenClaw SDK context, fail closed without it, copy bytes to private staging, validate content and Meta limits, hash and bind them to the resolved operation, and reject model-supplied paths or URLs. Owner commands remain separate. |
+| Ingest creative media | Accept only host-trusted inbound attachment bytes and metadata from supported public OpenClaw SDK context, fail closed without it, copy bytes to private staging, validate content and Meta limits, hash and bind them to the resolved operation, and reject model-supplied paths or URLs. PNG validation enforces valid CRCs and the required unique/ordered `IHDR`, optional `PLTE`, contiguous `IDAT`, and terminal `IEND` structure without decoding pixels. Owner commands remain separate. |
 | Create a complete campaign | Accept one product campaign kind, derive the fixed Meta combination, validate dynamic asset strings at runtime, and use validate-only preflight where applicable. Store one immutable operation valid while `now < created_at + 12 hours`. Approval creates Campaign, Ad Set, Creative, and Ad exactly once; only Campaign, Ad Set, and Ad are `PAUSED`, and Creative is bound. |
 | Edit, activate, pause, resume, or change budget | Store an immutable scoped operation. Delivery transitions support only Campaign, Ad Set, and Ad; Creative has no transition. Activation of new delivery objects requires separate approval. |
 | Approve a pending operation | Require `/approve-ad <operation_id>` from the one configured owner. Bind the decision to the immutable operation ID and payload, then record it separately. |
 | Reject a pending operation | Require `/reject-ad <operation_id>` from the same owner and prevent later execution. |
-| Execute an approved operation | Execute once using an idempotency guard, then record the result in the audit log. |
+| Execute an approved operation | Atomically claim it once, persist intent before every write, and record each outcome. Resume only known successful partial steps after restart; pause unresolved writes for reconciliation without redispatch. |
 | Expire a pending operation | Prevent later execution; create a new pending operation if the change is still wanted. |
 
 ### Approval identity and command boundary
@@ -150,7 +150,9 @@ v1
 <nonce_base64url>
 ```
 
-The signature therefore binds the exact request method, raw path including query string, and SHA-256 body hash as well as the decision, operation, owner, timestamp, and nonce. Current approve/reject requests have an empty body. A proof is valid for 300 seconds and MUST NOT be issued in the future. Verification uses timing-safe signature comparison, and each accepted nonce is persisted once before lifecycle processing so replay remains rejected across concurrency and restarts.
+The signature therefore binds the exact request method, raw path including query string, and SHA-256 body hash as well as the decision, operation, owner, timestamp, and nonce. Approve/reject requests have no body: any `Transfer-Encoding`, non-canonical or nonzero `Content-Length`, or parsed body is rejected before proof verification and decision processing. A proof is valid through exactly 300 seconds and MUST NOT be issued in the future. Freshness is checked again after secret lookup and at transaction entry. Verification uses timing-safe signature comparison, and each accepted nonce is persisted once before lifecycle processing so replay remains rejected across concurrency and restarts.
+
+Approval commands use durable fixed-window ingress limits: at most 120 admitted attempts per minute globally and 60 per minute for the configured owner. Excess attempts are rejected before proof processing with `429`, `Retry-After`, and bounded durable admitted/rejected counters. Every admitted attempt appends audit evidence. Audit rows are retained permanently, so their storage is not bounded, but their maximum growth is globally bounded to 120 rows per minute. Unreferenced proof nonces are deleted at startup and before each decision only after their 300-second replay horizon has elapsed; the fixed-window burst bound is 720 replay-cache rows (120 × six possible overlapping windows). Nonces referenced by immutable decisions are retained permanently.
 
 The global chat may compose an operational budget table by paging `/v1/scopes` and requesting pacing once per authorized pair. If Meta timezone is unavailable, the contract retains currency and monthly budget while explicitly marking reporting month and every timezone-dependent or derived value unavailable with reason `timezone_unavailable`. Otherwise FR-12 through FR-14 apply exact elapsed time; exact month start reports zero progress and expected spend while only projection is unavailable. Money uses ISO 4217 minor-unit round-half-even; ratios use 6 decimal places round-half-even.
 
@@ -169,6 +171,7 @@ Callers do not combine these Meta values independently. Asset IDs stay opaque st
 - `Idempotency-Key` binds authenticated caller, operation type, scope, and canonical payload hash. Same payload returns the immutable existing operation; different payload returns `409 idempotency_conflict`. The reservation has no short replay window.
 - Pagination cursors bind authenticated caller, client/account scope where applicable, and a hash of every filter. Mismatched reuse returns `400`.
 - Never automatically retry an ambiguously dispatched Meta write; retry a write only when endpoint-level idempotency exists or reconciliation proves first attempt did not commit. Reads, `429`, and temporary failures may use bounded `Retry-After`-aware retries.
+- Meta POSTs carry `appsecret_proof` in the form body. Meta GETs may carry it in the query only because Graph read endpoints require query parameters; request URLs are therefore excluded from logs and audit evidence, and all HTTP logging must redact the complete query string before serialization.
 
 ## Local deployment and storage
 
@@ -182,6 +185,8 @@ Callers do not combine these Meta values independently. Asset IDs stay opaque st
 | Meta credentials | Encrypted at rest; never returned to OpenClaw or exposed to AI/chat. |
 | OpenClaw service token | Cryptographically random, generated outside the repository, stored in macOS Keychain or injected through a protected SecretRef/runtime mechanism, restricted to the service/plugin, excluded from Git, and rotated. Never expose it to prompts, model tools, or logs. |
 
+The production runtime loads both the service token and channel-scoped owner identity from the login Keychain. The checked-in installer builds first, atomically writes and validates a secret-free per-user LaunchAgent, and uses absolute executable/project paths. SIGTERM and SIGINT close the HTTP application and SQLite once. Operational commands, logs, health checks, protected two-stage restore, Keychain availability, FileVault, firewall, and rotation constraints are documented in [Secure remote access](remote-access.md#fb-marketing-server-configuration-and-lifecycle).
+
 ## Data model boundaries
 
 These are schema-level concepts, not implementation prescriptions.
@@ -192,10 +197,11 @@ These are schema-level concepts, not implementation prescriptions.
 | `meta_apps` / `integrations` | Existing and target Developer Apps, portfolio ownership, credential subjects, permissions, validation evidence, and integration state. |
 | `ad_accounts` / `assets` | Client-owned Meta Business Assets, external IDs, ownership, partner sharing, tasks, and integration association. |
 | Encrypted credential metadata | Ciphertext reference, app and subject binding, scopes, lifecycle status, validation timestamps, and revocation evidence; never plaintext tokens. |
-| `pending_operations` / `approvals` | Immutable requested mutations, explicit approval decisions, expiry, idempotency identity, and execution outcome. |
-| `audit_log` | Append-only metadata for every Meta call, including reads, diagnostics, credential maintenance, mutations, failures, correlation IDs, actor/target context, and linked approval/execution evidence. Tokens, headers, and complete bodies are excluded. |
+| `operations` / `approval_decisions` | Immutable requested mutations, explicit decisions, expiry, idempotency identity, and terminal state. |
+| `operation_executions` / `operation_steps` | One atomic execution claim and immutable intent/outcome history for restart-safe mutation reconciliation. |
+| `audit_log` / execution audit links | Append-only metadata for every Meta call, including reads, diagnostics, credential maintenance, mutations, failures, correlation IDs, actor/target context, and linked approval/execution/step evidence. Tokens, headers, and complete bodies are excluded. |
 
-SQLite must use WAL mode and foreign-key enforcement. Multi-record state changes, especially approval and execution transitions, must be transactional. Backups must include a documented restore test and must remain protected by the same local access controls as the live database.
+SQLite must use WAL mode and foreign-key enforcement. Multi-record state changes, especially approval and execution transitions, must be transactional. Migration v6 preserves exact compatible v5 result bytes, step correlations, and linked audits; it fails closed instead of normalizing incompatible or unaudited history. Migration v7 enforces strict predecessor order and NULL-safe terminal-result shapes. Migration v8 preflights existing v7 evidence, rebuilds execution-audit links with step-key constraints, binds media steps to the exact scoped `operation_media` row, and requires every typed result resource to match the ordered immutable successful-step projection. Corrupt upgrades roll back at user version 7 without rewriting result bytes, correlations, or audits. New runtime claim, step, result, and reconciliation audits remain transactionally linked. Backups must include a documented restore test and must remain protected by the same local access controls as the live database.
 
 Credential validation, state maintenance, and human reauthorization run as internal scheduled or administrative mechanisms outside the model-facing HTTP contract. No credential-maintenance endpoint is required; safe integration status is the only HTTP diagnostic view.
 
@@ -219,6 +225,8 @@ Each pending operation records the integration generation it was validated again
 3. Validate replacement authority and define rollback triggers, including authorization regression, endpoint mismatch, duplicate risk, or incomplete audit evidence.
 4. Switch reads and mutations only after reconciliation, retain the previous generation as rollback, and verify the new generation.
 5. Resume mutations only when reconciliation proves that no operation can duplicate or run with the wrong credentials.
+
+`scripts/validate-migration.ts` makes this phased process deterministic without becoming a control plane. It validates the exact 14-app inventory and pilot-first batches, reads append-only redacted local evidence, and reports the first unmet gate. It does not call Meta, approve operations, change routing, or retire credentials. The paused canary must already carry a normal owner decision and prove every created delivery object remained `PAUSED`; old integrations remain available for rollback until an evidenced observation of at least seven full days completes.
 
 ## Delivery plan
 

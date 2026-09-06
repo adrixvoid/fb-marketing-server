@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { createHash, createHmac } from "node:crypto";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { connect } from "node:net";
 import test, { type TestContext } from "node:test";
-import { createApprovalHandlers, createApprovalService, signOwnerProof } from "../src/approval.js";
+import { ApprovalError, createApprovalHandlers, createApprovalService, signOwnerProof } from "../src/approval.js";
 import { buildApp } from "../src/app.js";
 import { openDatabase } from "../src/db.js";
 import { createMediaService } from "../src/media.js";
@@ -18,7 +19,9 @@ const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR
 
 class FakeSecrets implements SecretProvider {
   readonly values = new Map([["owner-proof-hmac-key", proofSecret]]);
-  async get(name: string) { return this.values.get(name); }
+  gets = 0;
+  constructor(private readonly beforeGet?: () => void) {}
+  async get(name: string) { this.gets += 1; this.beforeGet?.(); return this.values.get(name); }
   async create(name: string, value: string) {
     if (this.values.has(name)) return false;
     this.values.set(name, value);
@@ -44,14 +47,29 @@ function seed(db: ReturnType<typeof openDatabase>) {
   `);
 }
 
-async function fixture(t: TestContext, options: { campaign?: boolean; failRevalidation?: boolean; beforeDecisionCommit?: () => void } = {}) {
+async function fixture(t: TestContext, options: {
+  campaign?: boolean;
+  failRevalidation?: boolean;
+  crossExpiryDuringRevalidation?: boolean;
+  rotateGenerationDuringTarget?: boolean;
+  rotateGenerationAfterRevalidation?: boolean;
+  crossProofExpiryDuringSecretLookup?: boolean;
+  targetOperation?: boolean;
+  failMediaDelete?: boolean;
+  beforeDecisionCommit?: () => void;
+  rateLimit?: { windowSeconds: number; globalLimit: number; ownerLimit: number };
+  executeApproved?: (input: { operationId: string; actor: string; requestId: string }) => Promise<any>;
+} = {}) {
   const root = await mkdtemp(join(tmpdir(), "fb-marketing-server-approval-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const db = openDatabase(":memory:");
   t.after(() => db.close());
   seed(db);
   const mediaRoot = join(root, "media");
-  const media = await createMediaService({ db, dataRoot: root, mediaRoot, now: () => now });
+  const media = await createMediaService({
+    db, dataRoot: root, mediaRoot, now: () => now,
+    ...(options.failMediaDelete ? { removeFile: async () => { throw new Error("simulated delete failure"); } } : {}),
+  });
   let staged: Awaited<ReturnType<Awaited<ReturnType<typeof createMediaService>>["stage"]>> | undefined;
   if (options.campaign) {
     staged = await media.stage({
@@ -61,15 +79,37 @@ async function fixture(t: TestContext, options: { campaign?: boolean; failRevali
     });
   }
   let current = now;
+  let targetChecks = 0;
+  let generationRotated = false;
+  const rotateGeneration = () => {
+    if (generationRotated) return;
+    generationRotated = true;
+    db.exec(`
+      INSERT INTO integration_generations (id, integration_id, generation, status, validated_at)
+        VALUES ('generation-2', 'integration-1', '2026-09', 'active', '${now.toISOString()}');
+      INSERT INTO encrypted_credentials
+        (id, generation_id, subject_id, key_ref, envelope_version, ciphertext, iv, auth_tag, scopes, status, validated_at)
+        VALUES ('credential-2', 'generation-2', 'subject-1', 'key', 1, 'cipher', 'iv', 'tag',
+          '["ads_read","ads_management","pages_read_engagement","leads_retrieval","instagram_basic"]', 'active', '${now.toISOString()}');
+      UPDATE scope_mappings SET active = 0 WHERE client_id = 'client-1' AND ad_account_id = 'act_1';
+      INSERT INTO scope_mappings
+        (client_id, ad_account_id, generation_id, active, app_authorized, subject_authorized, partner_authorized, asset_authorized, granted_tasks)
+        VALUES ('client-1', 'act_1', 'generation-2', 1, 1, 1, 1, 1, '["ADVERTISE"]');
+    `);
+  };
   const operations = createOperationsService({
     db,
-    mediaRoot,
+    hashMediaFile: media.hashFile,
     now: () => current,
     capabilities: async () => ({
       assets: [{ asset_type: "page", page_id: "page-1", name: "Page" }, { asset_type: "pixel", pixel_id: "pixel-1", name: "Pixel" }],
       capabilities: { sales_website: { status: "available" }, leads_website: { status: "available" }, leads_instant_form: { status: "available" } },
     }),
-    validateTarget: async () => true,
+    validateTarget: async () => {
+      targetChecks += 1;
+      if (options.rotateGenerationDuringTarget && targetChecks === 2) rotateGeneration();
+      return true;
+    },
   });
   const proposal = await operations.propose({
     actor: "openclaw:user-1",
@@ -86,19 +126,29 @@ async function fixture(t: TestContext, options: { campaign?: boolean; failRevali
             ad: { name: "Ad" },
           },
         }
-      : { type: "configure_monthly_budget", client_id: "client-1", ad_account_id: "act_1", payload: { monthly_budget: { amount: "100.00", currency: "USD" } } },
+      : options.targetOperation
+        ? { type: "update_object", client_id: "client-1", ad_account_id: "act_1", payload: { object_type: "campaign", object_id: "campaign-1", changes: { name: "Renamed" } } }
+        : { type: "configure_monthly_budget", client_id: "client-1", ad_account_id: "act_1", payload: { monthly_budget: { amount: "100.00", currency: "USD" } } },
   });
-  const secrets = new FakeSecrets();
+  const secrets = new FakeSecrets(options.crossProofExpiryDuringSecretLookup ? () => { current = new Date(now.getTime() + 1_000); } : undefined);
   const approval = createApprovalService({
     db,
     secrets,
     ownerIdentity: owner,
     now: () => current,
-    revalidate: options.failRevalidation ? async () => { throw new Error("stale"); } : operations.revalidate,
+    revalidate: options.failRevalidation
+      ? async () => { throw new Error("stale"); }
+      : options.crossExpiryDuringRevalidation
+        ? async (input) => { const result = await operations.revalidate(input); current = new Date(proposal.operation.expires_at); return result; }
+        : options.rotateGenerationAfterRevalidation
+          ? async (input) => { const result = await operations.revalidate(input); rotateGeneration(); return result; }
+          : operations.revalidate,
     cleanupOperationMedia: media.cleanupOperation,
+    ...(options.executeApproved === undefined ? {} : { executeApproved: options.executeApproved }),
     ...(options.beforeDecisionCommit === undefined ? {} : { testHooks: { beforeDecisionCommit: options.beforeDecisionCommit } }),
+    ...(options.rateLimit === undefined ? {} : { rateLimit: options.rateLimit }),
   });
-  return { db, approval, operations, proposal, secrets, staged, mediaRoot, setNow: (value: Date) => { current = value; } };
+  return { root, db, approval, operations, proposal, secrets, staged, mediaRoot, setNow: (value: Date) => { current = value; } };
 }
 
 function proofFor(operationId: string, decision: "approved" | "rejected", nonce: number, issuedAt = now, overrides: Partial<Parameters<typeof signOwnerProof>[0]> = {}) {
@@ -110,6 +160,29 @@ function proofFor(operationId: string, decision: "approved" | "rejected", nonce:
       body: Buffer.alloc(0), issuedAt, nonce: Buffer.alloc(16, nonce), ...overrides,
     }),
   };
+}
+
+async function rawHttp(app: Awaited<ReturnType<typeof buildApp>>, request: string): Promise<{ status: number; headers: Record<string, string>; body: unknown }> {
+  await app.listen({ host: "127.0.0.1", port: 0 });
+  const address = app.server.address();
+  if (address === null || typeof address === "string") throw new Error("Test server did not bind TCP");
+  const response = await new Promise<string>((resolve, reject) => {
+    const socket = connect(address.port, "127.0.0.1");
+    let data = "";
+    socket.setEncoding("utf8");
+    socket.on("connect", () => socket.end(request));
+    socket.on("data", (chunk) => { data += chunk; });
+    socket.on("end", () => resolve(data));
+    socket.on("error", reject);
+  });
+  const [head, rawBody = ""] = response.split("\r\n\r\n", 2);
+  const lines = head!.split("\r\n");
+  const status = Number(lines[0]!.split(" ")[1]);
+  const headers = Object.fromEntries(lines.slice(1).map((line) => {
+    const separator = line.indexOf(":");
+    return [line.slice(0, separator).toLowerCase(), line.slice(separator + 1).trim()];
+  }));
+  return { status, headers, body: rawBody === "" ? undefined : JSON.parse(rawBody) };
 }
 
 test("accepts one fresh owner-bound approval proof and records an immutable linked decision without executing", async (t) => {
@@ -151,6 +224,91 @@ test("accepts one fresh owner-bound approval proof and records an immutable link
   assert.throws(() => db.prepare("DELETE FROM operation_audit_links").run(), /immutable/);
   assert.doesNotMatch(JSON.stringify(db.prepare("SELECT * FROM audit_log").all()), new RegExp(proof.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   assert.doesNotMatch(JSON.stringify(db.prepare("SELECT * FROM proof_nonces").all()), new RegExp(proofSecret.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+});
+
+test("executes after the immutable approved decision and returns a terminal result", async (t) => {
+  let executions = 0;
+  let value!: Awaited<ReturnType<typeof fixture>>;
+  value = await fixture(t, {
+    executeApproved: async ({ operationId, actor, requestId }) => {
+      executions += 1;
+      const operation = value.operations.get({ actor, requestId, clientId: "client-1", adAccountId: "act_1", operationId });
+      return { ...operation, status: "succeeded", result: { status: "succeeded", completed_at: now.toISOString() } };
+    },
+  });
+  const operationId = value.proposal.operation.operation_id;
+  const signed = proofFor(operationId, "approved", 46);
+
+  const result = await value.approval.decide({
+    actor: owner, requestId: "request-execute-after-approval", clientId: "client-1", adAccountId: "act_1",
+    operationId, decision: "approved", method: "POST", path: signed.path, body: Buffer.alloc(0), proof: signed.proof,
+  });
+
+  assert.equal(executions, 1);
+  assert.equal(result.status, "succeeded");
+  assert.equal(value.db.prepare("SELECT count(*) AS count FROM approval_decisions").get()!.count, 1);
+});
+
+test("reports execution-time staleness as an operation lifecycle conflict", async (t) => {
+  let value!: Awaited<ReturnType<typeof fixture>>;
+  value = await fixture(t, {
+    executeApproved: async ({ operationId, actor, requestId }) => ({
+      ...value.operations.get({ actor, requestId, clientId: "client-1", adAccountId: "act_1", operationId }),
+      status: "stale", result: null,
+    }),
+  });
+  const operationId = value.proposal.operation.operation_id;
+  const signed = proofFor(operationId, "approved", 47);
+  await assert.rejects(
+    value.approval.decide({
+      actor: owner, requestId: "request-stale-execution", clientId: "client-1", adAccountId: "act_1",
+      operationId, decision: "approved", method: "POST", path: signed.path, body: Buffer.alloc(0), proof: signed.proof,
+    }),
+    (error: unknown) => error instanceof ApprovalError && error.status === 409 && error.code === "operation_stale",
+  );
+  assert.equal(value.db.prepare("SELECT count(*) AS count FROM approval_decisions").get()!.count, 1);
+});
+
+test("owner route returns correlated lifecycle next actions for stale execution", async (t) => {
+  let value!: Awaited<ReturnType<typeof fixture>>;
+  value = await fixture(t, {
+    executeApproved: async ({ operationId, actor, requestId }) => ({
+      ...value.operations.get({ actor, requestId, clientId: "client-1", adAccountId: "act_1", operationId }),
+      status: "stale", result: null, next_action: "retry_new_operation",
+    } as never),
+  });
+  const operationId = value.proposal.operation.operation_id;
+  const signed = proofFor(operationId, "approved", 49);
+  const app = await buildApp({ serviceToken: "service-token", handlers: createApprovalHandlers(value.approval, owner) });
+  t.after(() => app.close());
+  const response = await app.inject({
+    method: "POST", url: signed.path,
+    headers: { authorization: "Bearer service-token", "x-request-id": "request-stale-next-action", "x-openclaw-owner-command": signed.proof },
+  });
+
+  assert.equal(response.statusCode, 409);
+  assert.equal(response.headers["x-request-id"], "request-stale-next-action");
+  assert.equal(response.json().code, "operation_stale");
+  assert.equal(response.json().next_action, "retry_new_operation");
+});
+
+test("reports an execution-time expiry at the exact boundary as gone", async (t) => {
+  let value!: Awaited<ReturnType<typeof fixture>>;
+  value = await fixture(t, {
+    executeApproved: async ({ operationId, actor, requestId }) => ({
+      ...value.operations.get({ actor, requestId, clientId: "client-1", adAccountId: "act_1", operationId }),
+      status: "expired", result: null,
+    }),
+  });
+  const operationId = value.proposal.operation.operation_id;
+  const signed = proofFor(operationId, "approved", 48);
+  await assert.rejects(
+    value.approval.decide({
+      actor: owner, requestId: "request-expired-execution", clientId: "client-1", adAccountId: "act_1",
+      operationId, decision: "approved", method: "POST", path: signed.path, body: Buffer.alloc(0), proof: signed.proof,
+    }),
+    (error: unknown) => error instanceof ApprovalError && error.status === 410 && error.code === "operation_expired",
+  );
 });
 
 test("rejects wrong owner, channel, freshness, method, path, body, secret, and malformed proofs before nonce persistence", async (t) => {
@@ -278,6 +436,136 @@ test("expires operations at exact equality and marks changed authority or media 
   assert.throws(() => media.db.prepare("UPDATE operations SET payload_hash = ?").run("0".repeat(64)), /immutable/);
 });
 
+test("expires instead of approving when revalidation crosses the exact operation deadline", async (t) => {
+  const value = await fixture(t, { crossExpiryDuringRevalidation: true });
+  const operationId = value.proposal.operation.operation_id;
+  const signed = proofFor(operationId, "approved", 18);
+  await assert.rejects(
+    value.approval.decide({ actor: owner, requestId: "request-cross-expiry", clientId: "client-1", adAccountId: "act_1", operationId, decision: "approved", method: "POST", path: signed.path, body: Buffer.alloc(0), proof: signed.proof }),
+    (error: unknown) => error instanceof Error && "code" in error && error.code === "operation_expired",
+  );
+  assert.equal(value.db.prepare("SELECT status FROM operations WHERE id = ?").get(operationId)!.status, "expired");
+  assert.equal(value.db.prepare("SELECT count(*) AS count FROM approval_decisions WHERE operation_id = ?").get(operationId)!.count, 0);
+});
+
+test("rejects approval when authoritative generation changes during or immediately after async revalidation", async (t) => {
+  for (const [name, options, nonce] of [
+    ["during target validation", { targetOperation: true, rotateGenerationDuringTarget: true }, 22],
+    ["after revalidation", { rotateGenerationAfterRevalidation: true }, 23],
+  ] as const) {
+    const value = await fixture(t, options);
+    const operationId = value.proposal.operation.operation_id;
+    const signed = proofFor(operationId, "approved", nonce);
+    await assert.rejects(
+      value.approval.decide({ actor: owner, requestId: `request-generation-race-${nonce}`, clientId: "client-1", adAccountId: "act_1", operationId, decision: "approved", method: "POST", path: signed.path, body: Buffer.alloc(0), proof: signed.proof }),
+      (error: unknown) => error instanceof Error && "code" in error && error.code === "operation_stale",
+      name,
+    );
+    assert.equal(value.db.prepare("SELECT status FROM operations WHERE id = ?").get(operationId)!.status, "stale");
+    assert.equal(value.db.prepare("SELECT count(*) AS count FROM approval_decisions WHERE operation_id = ?").get(operationId)!.count, 0);
+    assert.deepEqual({ ...value.db.prepare("SELECT correlation_id, json_extract(evidence, '$.errorCode') AS code FROM audit_log WHERE logical_operation = 'approve_operation' ORDER BY rowid DESC LIMIT 1").get() }, {
+      correlation_id: `request-generation-race-${nonce}`,
+      code: "operation_stale",
+    });
+  }
+});
+
+test("rejects a proof that crosses freshness during secret lookup without consuming its nonce", async (t) => {
+  const value = await fixture(t, { crossProofExpiryDuringSecretLookup: true });
+  const operationId = value.proposal.operation.operation_id;
+  const signed = proofFor(operationId, "approved", 24, new Date(now.getTime() - 300_000));
+  await assert.rejects(
+    value.approval.decide({ actor: owner, requestId: "request-secret-expiry", clientId: "client-1", adAccountId: "act_1", operationId, decision: "approved", method: "POST", path: signed.path, body: Buffer.alloc(0), proof: signed.proof }),
+    (error: unknown) => error instanceof Error && "code" in error && error.code === "forbidden",
+  );
+  assert.equal(value.db.prepare("SELECT count(*) AS count FROM proof_nonces").get()!.count, 0);
+  assert.equal(value.db.prepare("SELECT count(*) AS count FROM approval_decisions").get()!.count, 0);
+  assert.deepEqual({ ...value.db.prepare("SELECT correlation_id, json_extract(evidence, '$.errorCode') AS code FROM audit_log WHERE logical_operation = 'approve_operation' ORDER BY rowid DESC LIMIT 1").get() }, {
+    correlation_id: "request-secret-expiry",
+    code: "forbidden",
+  });
+});
+
+test("reconciles terminal media after deletion fails and the service restarts", async (t) => {
+  const value = await fixture(t, { campaign: true, failMediaDelete: true });
+  const operationId = value.proposal.operation.operation_id;
+  const row = value.db.prepare("SELECT storage_name FROM staged_media WHERE id = ?").get(value.staged!.media.media_id)!;
+  const signed = proofFor(operationId, "rejected", 19);
+  await assert.rejects(value.approval.decide({ actor: owner, requestId: "request-delete-crash", clientId: "client-1", adAccountId: "act_1", operationId, decision: "rejected", method: "POST", path: signed.path, body: Buffer.alloc(0), proof: signed.proof }), /delete failure/);
+  assert.equal(value.db.prepare("SELECT status FROM staged_media WHERE id = ?").get(value.staged!.media.media_id)!.status, "consumed");
+  assert.equal((await stat(join(value.mediaRoot, String(row.storage_name)))).isFile(), true);
+  const outside = join(value.root, "outside-canary");
+  await writeFile(outside, "preserve");
+  await writeFile(join(value.mediaRoot, "orphan.tmp"), "orphan");
+  await symlink(outside, join(value.mediaRoot, "orphan-link"));
+  await createMediaService({ db: value.db, dataRoot: value.root, mediaRoot: value.mediaRoot, now: () => now });
+  await assert.rejects(stat(join(value.mediaRoot, String(row.storage_name))));
+  await assert.rejects(stat(join(value.mediaRoot, "orphan.tmp")));
+  await assert.rejects(stat(join(value.mediaRoot, "orphan-link")));
+  assert.equal(await readFile(outside, "utf8"), "preserve");
+});
+
+test("durably rate-limits approval attempts before processing without silently dropping admitted audits", async (t) => {
+  const value = await fixture(t, { rateLimit: { windowSeconds: 60, globalLimit: 2, ownerLimit: 1 } });
+  const operationId = value.proposal.operation.operation_id;
+  await assert.rejects(value.approval.decide({ actor: owner, requestId: "request-bad-proof-0", clientId: "client-1", adAccountId: "act_1", operationId, decision: "approved", method: "POST", path: "/wrong", body: Buffer.alloc(0), proof: "invalid" }), ApprovalError);
+  await assert.rejects(
+    value.approval.decide({ actor: owner, requestId: "request-bad-proof-1", clientId: "client-1", adAccountId: "act_1", operationId, decision: "approved", method: "POST", path: "/wrong", body: Buffer.alloc(0), proof: "invalid" }),
+    (error: unknown) => error instanceof ApprovalError && error.status === 429 && error.code === "rate_limited" && error.retryAfterSeconds === 60,
+  );
+  assert.equal(value.db.prepare("SELECT count(*) AS count FROM audit_log WHERE logical_operation = 'approve_operation' AND outcome = 'failed'").get()!.count, 1);
+  assert.deepEqual(value.db.prepare("SELECT scope, admitted_count, rejected_count FROM approval_rate_limits ORDER BY scope").all().map((row) => ({ ...row })), [
+    { scope: "global", admitted_count: 1, rejected_count: 1 },
+    { scope: "owner", admitted_count: 1, rejected_count: 1 },
+  ]);
+
+  const app = await buildApp({ serviceToken: "service-token", handlers: createApprovalHandlers(value.approval, owner) });
+  t.after(() => app.close());
+  const shaped = proofFor(operationId, "approved", 25);
+  const invalid = `${shaped.proof.slice(0, -1)}${shaped.proof.endsWith("A") ? "B" : "A"}`;
+  const response = await app.inject({ method: "POST", url: shaped.path, headers: { authorization: "Bearer service-token", "x-openclaw-owner-command": invalid, "x-request-id": "request-rate-limited" } });
+  assert.equal(response.statusCode, 429);
+  assert.equal(response.headers["retry-after"], "60");
+  assert.deepEqual(response.json(), {
+    type: "urn:fb-marketing-server:rate_limited", title: "Rate limited", status: 429, code: "rate_limited",
+    detail: "Owner decision rate limit exceeded", request_id: "request-rate-limited",
+  });
+  const rejectedPath = `/v1/operations/${operationId}/reject?client_id=client-1&ad_account_id=act_1`;
+  const rejected = await app.inject({ method: "POST", url: rejectedPath, headers: { authorization: "Bearer service-token", "x-openclaw-owner-command": invalid, "x-request-id": "request-reject-rate-limited" } });
+  assert.equal(rejected.statusCode, 429);
+  assert.equal(rejected.json().code, "rate_limited");
+});
+
+test("purges only irreversibly expired unreferenced proof nonces and preserves decision evidence", async (t) => {
+  const value = await fixture(t, { failRevalidation: true });
+  const operationId = value.proposal.operation.operation_id;
+  const signed = proofFor(operationId, "approved", 26);
+  await assert.rejects(value.approval.decide({ actor: owner, requestId: "request-unreferenced", clientId: "client-1", adAccountId: "act_1", operationId, decision: "approved", method: "POST", path: signed.path, body: Buffer.alloc(0), proof: signed.proof }), ApprovalError);
+  assert.equal(value.db.prepare("SELECT count(*) AS count FROM proof_nonces").get()!.count, 1);
+  assert.throws(() => value.db.prepare("DELETE FROM proof_nonces").run(), /replay horizon/);
+  value.setNow(new Date(now.getTime() + 301_000));
+  value.approval.purgeExpiredNonces();
+  assert.equal(value.db.prepare("SELECT count(*) AS count FROM proof_nonces").get()!.count, 0);
+
+  const decided = await fixture(t);
+  const decidedId = decided.proposal.operation.operation_id;
+  const accepted = proofFor(decidedId, "approved", 27);
+  await decided.approval.decide({ actor: owner, requestId: "request-referenced", clientId: "client-1", adAccountId: "act_1", operationId: decidedId, decision: "approved", method: "POST", path: accepted.path, body: Buffer.alloc(0), proof: accepted.proof });
+  decided.setNow(new Date(now.getTime() + 301_000));
+  decided.approval.purgeExpiredNonces();
+  assert.equal(decided.db.prepare("SELECT count(*) AS count FROM proof_nonces").get()!.count, 1);
+  assert.throws(() => decided.db.prepare("DELETE FROM proof_nonces").run(), /decision|replay horizon/i);
+
+  const bounded = await fixture(t, { failRevalidation: true, rateLimit: { windowSeconds: 60, globalLimit: 1, ownerLimit: 1 } });
+  for (let minute = 0; minute <= 6; minute += 1) {
+    const at = new Date(now.getTime() + minute * 60_000);
+    bounded.setNow(at);
+    const attempt = proofFor(bounded.proposal.operation.operation_id, "approved", 28 + minute, at);
+    await assert.rejects(bounded.approval.decide({ actor: owner, requestId: `request-retention-${minute}`, clientId: "client-1", adAccountId: "act_1", operationId: bounded.proposal.operation.operation_id, decision: "approved", method: "POST", path: attempt.path, body: Buffer.alloc(0), proof: attempt.proof }), ApprovalError);
+  }
+  assert.equal(bounded.db.prepare("SELECT count(*) AS count FROM proof_nonces").get()!.count, 6);
+});
+
 test("rolls back decision, operation state, and linked audit together when decision commit crashes", async (t) => {
   const value = await fixture(t, { beforeDecisionCommit: () => { throw new Error("crash before commit"); } });
   const operationId = value.proposal.operation.operation_id;
@@ -313,7 +601,20 @@ test("owner-command handlers return contract-valid correlated 202 approval and 2
   assert.equal(approved.headers["x-request-id"], "request-approved-route");
   assert.equal(approved.json().request_id, "request-approved-route");
   assert.equal(approved.json().operation.status, "pending");
+  assert.equal(approved.json().operation.next_action, "approve_or_reject");
   assert.equal(approved.json().operation.decision.decision, "approved");
+
+  const invalidProof = `${approvedProof.proof.slice(0, -1)}${approvedProof.proof.endsWith("A") ? "B" : "A"}`;
+  const failed = await approvedApp.inject({
+    method: "POST",
+    url: approvedProof.path,
+    headers: { authorization: "Bearer service-token", "x-openclaw-owner-command": invalidProof },
+  });
+  const generated = failed.headers["x-request-id"];
+  assert.equal(failed.statusCode, 403);
+  assert.match(String(generated), /^[0-9a-f-]{36}$/);
+  assert.equal(failed.json().request_id, generated);
+  assert.equal(approvedValue.db.prepare("SELECT correlation_id FROM audit_log WHERE logical_operation = 'approve_operation' AND outcome = 'failed' ORDER BY rowid DESC").get()!.correlation_id, generated);
 
   const rejectedValue = await fixture(t);
   const rejectedId = rejectedValue.proposal.operation.operation_id;
@@ -327,7 +628,91 @@ test("owner-command handlers return contract-valid correlated 202 approval and 2
   });
   assert.equal(rejected.statusCode, 200);
   assert.equal(rejected.json().operation.status, "rejected");
+  assert.equal(rejected.json().operation.next_action, "no_action");
   assert.equal(rejected.json().operation.decision.decision, "rejected");
+});
+
+test("raw chunked approval and rejection bodies fail closed before decision processing", async (t) => {
+  for (const [decision, nonce] of [["approved", 40], ["rejected", 41]] as const) {
+    const value = await fixture(t);
+    const operationId = value.proposal.operation.operation_id;
+    const signed = proofFor(operationId, decision, nonce);
+    const app = await buildApp({ serviceToken: "service-token", handlers: createApprovalHandlers(value.approval, owner) });
+    t.after(() => app.close());
+    const multipart = "--x\r\nContent-Disposition: form-data; name=\"unexpected\"\r\n\r\nvalue\r\n--x--\r\n";
+    const requestIdValue = `request-chunked-${decision}`;
+    const response = await rawHttp(app, [
+      `POST ${signed.path} HTTP/1.1`,
+      "Host: 127.0.0.1",
+      "Authorization: Bearer service-token",
+      `X-Request-ID: ${requestIdValue}`,
+      `X-OpenClaw-Owner-Command: ${signed.proof}`,
+      "Transfer-Encoding: chunked",
+      "Content-Type: multipart/form-data; boundary=x",
+      "Connection: close",
+      "",
+      `${Buffer.byteLength(multipart).toString(16)}\r\n${multipart}\r\n0\r\n\r\n`,
+    ].join("\r\n"));
+    assert.equal(response.status, 400);
+    assert.equal(response.headers["x-request-id"], requestIdValue);
+    assert.deepEqual(response.body, {
+      type: "urn:fb-marketing-server:validation_error", title: "Bad request", status: 400, code: "validation_error",
+      detail: "Owner command body must be empty", request_id: requestIdValue,
+    });
+    assert.equal(value.db.prepare("SELECT count(*) AS count FROM approval_decisions").get()!.count, 0);
+    assert.equal(value.db.prepare("SELECT status FROM operations WHERE id = ?").get(operationId)!.status, "pending");
+    assert.equal(value.db.prepare("SELECT count(*) AS count FROM proof_nonces").get()!.count, 0);
+    assert.equal(value.db.prepare("SELECT count(*) AS count FROM audit_log WHERE logical_operation IN ('approve_operation', 'reject_operation')").get()!.count, 0);
+    assert.equal(value.secrets.gets, 0);
+  }
+});
+
+test("approval framing rejects every body signal while truly empty approval and rejection remain valid", async (t) => {
+  for (const [name, headers, payload] of [
+    ["transfer encoding", { "transfer-encoding": "identity" }, undefined],
+    ["nonzero length", { "content-length": "2", "content-type": "text/plain" }, "ok"],
+    ["malformed length", { "content-length": "banana" }, undefined],
+  ] as const) {
+    const value = await fixture(t);
+    const signed = proofFor(value.proposal.operation.operation_id, "approved", 42);
+    const app = await buildApp({ serviceToken: "service-token", handlers: createApprovalHandlers(value.approval, owner) });
+    t.after(() => app.close());
+    const response = await app.inject({ method: "POST", url: signed.path, headers: { authorization: "Bearer service-token", "x-request-id": `request-${name.replaceAll(" ", "-")}`, "x-openclaw-owner-command": signed.proof, ...headers }, ...(payload === undefined ? {} : { payload }) });
+    assert.equal(response.statusCode, 400, name);
+    assert.equal(value.db.prepare("SELECT count(*) AS count FROM approval_decisions").get()!.count, 0, name);
+    assert.equal(value.secrets.gets, 0, name);
+  }
+
+  const parsed = await fixture(t);
+  const parsedResponse = await createApprovalHandlers(parsed.approval, owner).approveOperation!(
+    { request: { headers: { "x-request-id": "request-parsed-body" } } } as never,
+    { headers: { "content-length": "0" }, body: { unexpected: true } } as never,
+  );
+  assert.equal((parsedResponse as { statusCode: number }).statusCode, 400);
+  assert.equal(parsed.db.prepare("SELECT count(*) AS count FROM approval_decisions").get()!.count, 0);
+  assert.equal(parsed.secrets.gets, 0);
+
+  const duplicate = await fixture(t);
+  const duplicateProof = proofFor(duplicate.proposal.operation.operation_id, "approved", 43);
+  const duplicateApp = await buildApp({ serviceToken: "service-token", handlers: createApprovalHandlers(duplicate.approval, owner) });
+  t.after(() => duplicateApp.close());
+  const duplicateResponse = await rawHttp(duplicateApp, [
+    `POST ${duplicateProof.path} HTTP/1.1`, "Host: 127.0.0.1", "Authorization: Bearer service-token",
+    `X-OpenClaw-Owner-Command: ${duplicateProof.proof}`, "Content-Length: 0", "Content-Length: 0", "Connection: close", "", "",
+  ].join("\r\n"));
+  assert.equal(duplicateResponse.status, 400);
+  assert.equal(duplicate.db.prepare("SELECT count(*) AS count FROM approval_decisions").get()!.count, 0);
+
+  for (const [decision, nonce, status] of [["approved", 44, 202], ["rejected", 45, 200]] as const) {
+    const valid = await fixture(t);
+    const signed = proofFor(valid.proposal.operation.operation_id, decision, nonce);
+    const app = await buildApp({ serviceToken: "service-token", handlers: createApprovalHandlers(valid.approval, owner) });
+    t.after(() => app.close());
+    const response = await app.inject({ method: "POST", url: signed.path, headers: { authorization: "Bearer service-token", "x-openclaw-owner-command": signed.proof } });
+    assert.equal(response.statusCode, status);
+    assert.equal(valid.db.prepare("SELECT count(*) AS count FROM approval_decisions").get()!.count, 1);
+    assert.equal(valid.secrets.gets, 1);
+  }
 });
 
 test("documents the exact model-inaccessible owner proof protocol", async () => {
@@ -335,6 +720,8 @@ test("documents the exact model-inaccessible owner proof protocol", async () => 
   assert.match(architecture, /v1\.<issued_at_unix_seconds>\.<nonce_base64url>\.<owner_identity_base64url>\.<signature_base64url>/);
   assert.match(architecture, /HMAC-SHA256/);
   assert.match(architecture, /exact request method, raw path including query string, and SHA-256 body hash/);
-  assert.match(architecture, /valid for 300 seconds and MUST NOT be issued in the future/);
+  assert.match(architecture, /valid through exactly 300 seconds and MUST NOT be issued in the future/);
+  assert.match(architecture, /at most 120 admitted attempts per minute globally and 60 per minute for the configured owner/);
+  assert.match(architecture, /any `Transfer-Encoding`, non-canonical or nonzero `Content-Length`, or parsed body is rejected/);
   assert.match(architecture, /OPENCLAW_OWNER_IDENTITY/);
 });

@@ -13,7 +13,13 @@
     "typecheck": "tsc --noEmit",
     "build": "npm run generate:check && tsc && node -e \"require('node:fs').copyFileSync('openapi.yaml','dist/openapi.yaml')\"",
     "start": "node dist/src/server.js",
-    "test": "node --import tsx --test test/*.test.ts"
+    "test": "node --import tsx --test test/*.test.ts",
+    "service:install": "tsx scripts/install-launchagent.ts install",
+    "service:uninstall": "tsx scripts/install-launchagent.ts uninstall",
+    "service:status": "tsx scripts/install-launchagent.ts status",
+    "db": "tsx scripts/database.ts",
+    "migration:validate": "tsx scripts/validate-migration.ts validate",
+    "migration:evidence": "tsx scripts/validate-migration.ts record"
   },
   "dependencies": {
     "@fastify/multipart": "10.1.1",

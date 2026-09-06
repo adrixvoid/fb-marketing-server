@@ -2,6 +2,7 @@ import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import type { Context, HandlerMap } from "openapi-backend";
 import type { ContractResponse } from "./contract.js";
+import { requestId } from "./request-id.js";
 import type { components } from "./generated/openapi.js";
 import { MetaError, type AsyncInsightsRequest, type MetaPageRequest, type MetaRequest } from "./meta-client.js";
 import { resolveScope, type ResolvedScope } from "./scope.js";
@@ -601,11 +602,6 @@ function integerValue(value: unknown, fallback: number): number {
   return parsed;
 }
 
-function requestId(context: Context): string {
-  const value = stringValue(context.request.headers["x-request-id"]);
-  return value ?? crypto.randomUUID();
-}
-
 function success(id: string, body: unknown): ContractResponse {
   return { statusCode: 200, mediaType: "application/json", headers: { "x-request-id": id }, body };
 }
@@ -652,7 +648,7 @@ function errorResponse(context: Context, id: string, error: unknown): ContractRe
 
 export function createReportingHandlers(service: ReportingService, actor: string): HandlerMap {
   const handle = (work: (context: Context, id: string) => unknown | Promise<unknown>) => async (context: Context) => {
-    const id = requestId(context);
+    const id = requestId(context.request.headers["x-request-id"]);
     try {
       return success(id, await work(context, id));
     } catch (error) {

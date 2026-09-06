@@ -59,7 +59,7 @@ Feature-gate mutations, restore protected SQLite state, and revert integration g
 
 ## Success Criteria
 
-- [ ] Invalid scope fails before Meta access; canary scans show no token exposure.
-- [ ] Both pilot accounts independently pass capabilities, metrics, pacing, and redacted audit checks.
-- [ ] Each campaign kind creates one paused bundle after valid approval; activation is separate, expiry is exact at 12 hours, and replay/restart cannot duplicate execution.
-- [ ] Central-app pilot, reversible mutation, restore, and 7-day rollback evidence pass.
+- [x] Automated tests prove invalid scope fails before Meta access and canary scans expose no tokens.
+- [x] Fixture-backed tests prove independent account capabilities, metrics, pacing, redacted audits, paused bundles, exact expiry, and replay/restart safety.
+- [ ] Both real pilot accounts independently pass capabilities, metrics, pacing, and redacted audit checks.
+- [ ] The real central-app pilot, reversible mutation, restore, per-client cutover, 7-day observation, rollback exercise, and retirement evidence pass.

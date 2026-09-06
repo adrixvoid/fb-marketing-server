@@ -1,13 +1,14 @@
 import { mkdir } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { buildApp, type AppOptions } from "./app.js";
 import { createApprovalHandlers, createApprovalService, validOwnerIdentity } from "./approval.js";
-import { appendAudit, openDatabase } from "./db.js";
+import { appendAudit, openDatabase, transaction } from "./db.js";
 import { createMetaClient, type MetaScope } from "./meta-client.js";
 import { createMediaHandlers, createMediaService } from "./media.js";
-import { createOperationHandlers, createOperationsService } from "./operations.js";
+import { createExecutionService, createOperationHandlers, createOperationsService } from "./operations.js";
 import { createPacingHandlers, createPacingService } from "./pacing.js";
 import { createReportingHandlers, createReportingService } from "./reporting.js";
 import {
@@ -34,6 +35,21 @@ export function runtimeEnvironment(environment: Record<string, string | undefine
   const port = Number(rawPort);
   if (port > 65_535) throw new Error("Invalid PORT");
   return { serviceToken, ownerIdentity, port };
+}
+
+export async function loadProductionEnvironment(
+  secrets: SecretProvider,
+  environment: Record<string, string | undefined>,
+) {
+  const [serviceToken, ownerIdentity] = await Promise.all([
+    secrets.get("openclaw-service-token"),
+    secrets.get("openclaw-owner-identity"),
+  ]);
+  return runtimeEnvironment({
+    PORT: environment.PORT,
+    OPENCLAW_SERVICE_TOKEN: serviceToken,
+    OPENCLAW_OWNER_IDENTITY: ownerIdentity,
+  });
 }
 
 interface RuntimeTestHooks {
@@ -132,7 +148,19 @@ export async function createRuntime(options: RuntimeOptions) {
     const meta = createMetaClient({
       fetch: options.fetch ?? globalThis.fetch,
       getCredentials: credentialLoader(db, secrets),
-      audit: (event) => appendAudit(db, event),
+      audit: (event) => transaction(db, () => {
+        const auditId = appendAudit(db, event);
+        const step = db.prepare(`SELECT s.operation_id, s.execution_id, s.step_key, e.decision_id
+          FROM operation_steps s JOIN operation_executions e ON e.id = s.execution_id
+          WHERE s.correlation_id = ?`).get(event.correlationId) as {
+            operation_id: string; execution_id: string; step_key: string; decision_id: string;
+          } | undefined;
+        if (step !== undefined) db.prepare(`INSERT INTO operation_execution_audit_links
+          (audit_id, operation_id, decision_id, execution_id, step_key, event_type)
+          VALUES (?, ?, ?, ?, ?, 'meta_call')`)
+          .run(auditId, step.operation_id, step.decision_id, step.execution_id, step.step_key);
+        return auditId;
+      }),
       ...(options.now === undefined ? {} : { now: options.now }),
     });
     const reporting = createReportingService({
@@ -157,7 +185,7 @@ export async function createRuntime(options: RuntimeOptions) {
     await media.cleanupExpired();
     const operations = createOperationsService({
       db,
-      mediaRoot,
+      hashMediaFile: media.hashFile,
       capabilities: async (input) => {
         const assets: Awaited<ReturnType<typeof reporting.getCapabilities>>["assets"] = [];
         let cursor: string | undefined;
@@ -183,12 +211,22 @@ export async function createRuntime(options: RuntimeOptions) {
       },
       ...(options.now === undefined ? {} : { now: options.now }),
     });
+    const execution = createExecutionService({
+      db,
+      meta,
+      revalidate: operations.revalidate,
+      readMedia: media.readBound,
+      cleanupOperationMedia: media.cleanupOperation,
+      ...(options.now === undefined ? {} : { now: options.now }),
+    });
+    await execution.reconcile({ actor: "system:recovery", requestId: randomUUID() });
     const approval = createApprovalService({
       db,
       secrets,
       ownerIdentity: options.ownerIdentity,
       revalidate: operations.revalidate,
       cleanupOperationMedia: media.cleanupOperation,
+      executeApproved: execution.execute,
       ...(options.now === undefined ? {} : { now: options.now }),
     });
     const application = options.buildApplication ?? buildApp;

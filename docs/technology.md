@@ -15,7 +15,7 @@ The MVP is a small macOS-hosted Node.js service with an OpenAPI-first boundary. 
 | Media inspection | `file-type` | Sniff actual content before staging. Meta validate-only handles endpoint-specific constraints; do not add `sharp` or `ffmpeg` initially. |
 | Meta transport | Built-in `fetch`, `FormData`, `Blob`, and `AbortSignal` | Native HTTP and multipart support with explicit status and rate-limit headers and no transport dependency. |
 | Platform services | `node:crypto`, `crypto.randomUUID`, `node:test`, macOS `security`/Keychain, and `launchd` | Native cryptography, identifiers, tests, secret storage, and process lifecycle. |
-| OpenClaw | Host-supplied plugin peer dependency with focused public SDK imports | The OpenClaw host provides the compatible SDK; it is not an application runtime dependency. |
+| OpenClaw | Installable `packages/openclaw-plugin`, compatible with host version `2026.9.2` through a peer dependency and focused public SDK imports | The OpenClaw host supplies the SDK; the service runtime does not depend on it. |
 
 `node:sqlite` is a release candidate in Node 24, not yet stable. Its small dependency surface and built-in prepared statements/backups fit this local MVP, but compatibility and restore tests are mandatory. Use `better-sqlite3` only if a reproducible `node:sqlite` correctness, performance, or operability problem appears.
 
@@ -26,7 +26,7 @@ The MVP is a small macOS-hosted Node.js service with an OpenAPI-first boundary. 
 | Class | Packages or facilities |
 |---|---|
 | Runtime | `fastify`, `openapi-backend`, `@fastify/multipart`, `decimal.js`, `file-type`; Node built-ins provide HTTP client, crypto, SQLite, and tests. |
-| Host plugin peer | Host-compatible published OpenClaw public plugin SDK; not installed or bundled as an application runtime dependency. |
+| Host plugin peer | Exact compatible `openclaw@2026.9.2`; it is used to check/package the plugin and is not an application runtime dependency. |
 | Development | `typescript`, `openapi-typescript`, `yaml`, `tsx`, `@types/node`. `yaml` is a direct parser dependency for generation, never a transitive assumption. |
 | Native operating system | macOS `security` CLI/Keychain and `launchd`. |
 
@@ -38,7 +38,7 @@ Choose native `fetch` over Axios. Node already provides cancellation, multipart 
 
 `MetaClient` owns:
 
-- the fixed `/v26.0` base path, `Authorization: Bearer`, and `appsecret_proof` HMAC;
+- the fixed `/v26.0` base path, `Authorization: Bearer`, and `appsecret_proof` HMAC; POST proof is a native form field, while the required GET query proof is permitted only with complete URL-query redaction from logs and audit evidence;
 - timeout and cancellation;
 - bounded, `Retry-After`-aware retries for reads, `429`, and temporary failures;
 - no automatic retry of an ambiguously dispatched Meta write; retry a write only when endpoint-level idempotency exists or reconciliation proves the first attempt did not commit;
@@ -54,7 +54,7 @@ As of 2026-08-18, the official `facebook-nodejs-business-sdk` npm release is `24
 
 For `/v1/media`, `openapi-backend` handles route, headers, and security. The `@fastify/multipart` handling explicitly validates multipart fields, byte limits, declared MIME, content sniffing with `file-type`, and complete stream consumption. Do not treat streamed multipart as a normally parsed body validated by `openapi-backend`.
 
-The OpenClaw plugin registers a curated projection with concise JSON Schemas rather than injecting the full contract into every prompt. Proposed model-visible tools are `list_scopes`, `integration_status`, `get_capabilities`, `list_campaigns`, `query_insights`, `budget_summary`, `upload_chat_media`, `propose_operation`, and `get_operation`. `upload_chat_media` accepts only host-trusted inbound attachment bytes and metadata from supported public OpenClaw SDK context, rejects model paths and URLs, and fails closed without trusted attachment context. Approval and rejection remain separate deterministic owner-only commands outside LLM tools.
+The OpenClaw plugin registers a curated projection with concise TypeBox schemas rather than injecting the full contract into every prompt. Its model-visible tools are exactly `list_scopes`, `integration_status`, `get_capabilities`, `list_campaigns`, `query_insights`, `budget_summary`, `upload_chat_media`, `propose_operation`, and `get_operation`. `upload_chat_media` accepts only one-use host-trusted inbound attachment metadata from `inbound_claim`, confines resolved bytes to configured roots, rejects model paths and URLs, and fails closed without trusted context. `approve-ad` and `reject-ad` are separate deterministic owner-only commands outside model dispatch.
 
 Static options come from OpenAPI enums. Dynamic assets and currently usable options come from scoped `GET /v1/capabilities`; their opaque IDs and access are revalidated at proposal creation and execution.
 

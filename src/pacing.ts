@@ -3,6 +3,7 @@ import { Decimal } from "decimal.js";
 import type { DatabaseSync } from "node:sqlite";
 import type { Context, HandlerMap } from "openapi-backend";
 import type { ContractResponse } from "./contract.js";
+import { requestId } from "./request-id.js";
 import type { components } from "./generated/openapi.js";
 import { MetaError, type AsyncInsightsRequest, type MetaRequest } from "./meta-client.js";
 import { resolveScope } from "./scope.js";
@@ -276,11 +277,6 @@ export function createPacingService({ db, meta, now = () => new Date() }: Pacing
 
 export type PacingService = ReturnType<typeof createPacingService>;
 
-function requestId(context: Context): string {
-  const value = context.request.headers["x-request-id"];
-  return typeof value === "string" ? value : crypto.randomUUID();
-}
-
 function problem(context: Context, id: string, error: unknown): ContractResponse {
   const message = error instanceof Error ? error.message : "";
   const meta = error instanceof MetaError;
@@ -307,7 +303,7 @@ function problem(context: Context, id: string, error: unknown): ContractResponse
 export function createPacingHandlers(service: PacingService, actor: string): HandlerMap {
   return {
     getBudgetPacing: async (context: Context) => {
-      const id = requestId(context);
+      const id = requestId(context.request.headers["x-request-id"]);
       const query = context.request.query as Record<string, unknown>;
       try {
         const body = await service.getBudgetPacing({

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -37,7 +38,7 @@ function seed(db: ReturnType<typeof openDatabase>) {
   `);
 }
 
-async function fixture(t: TestContext, options: { validateTarget?: boolean; formPage?: string } = {}) {
+async function fixture(t: TestContext, options: { validateTarget?: boolean; formPage?: string; formPublished?: boolean; formUsable?: boolean; omitFormState?: boolean } = {}) {
   const root = await mkdtemp(join(tmpdir(), "fb-marketing-server-operations-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const db = openDatabase(":memory:");
@@ -59,12 +60,12 @@ async function fixture(t: TestContext, options: { validateTarget?: boolean; form
   let current = now;
   const operations = createOperationsService({
     db,
-    mediaRoot,
+    hashMediaFile: media.hashFile,
     capabilities: async () => ({
       assets: [
         { asset_type: "page", page_id: "page-1", name: "Page" },
         { asset_type: "pixel", pixel_id: "pixel-1", name: "Pixel" },
-        { asset_type: "lead_form", lead_gen_form_id: "form-1", page_id: options.formPage ?? "page-1", name: "Form", published: true, usable: true },
+        { asset_type: "lead_form", lead_gen_form_id: "form-1", page_id: options.formPage ?? "page-1", name: "Form", ...(options.omitFormState ? {} : { published: options.formPublished ?? true, usable: options.formUsable ?? true }) } as never,
       ],
       capabilities: {
         sales_website: { status: "available" },
@@ -120,6 +121,129 @@ test("creates one immutable pending proposal and canonically reuses its permanen
   );
   assert.equal(db.prepare("SELECT count(*) AS count FROM audit_log WHERE logical_operation = 'propose_operation' AND outcome = 'failed'").get()!.count, 1);
   assert.equal(db.prepare("SELECT count(*) AS count FROM operation_audit_links WHERE operation_id = ?").get(created.operation.operation_id)!.count, 2);
+});
+
+test("canonicalizes nested Unicode object keys by UTF-16 code units without locale dependence", () => {
+  const left = { "\uE000": 4, "😀": { "é": 3, "e\u0301": 2 }, A: 1 };
+  const right = { A: 1, "😀": { "e\u0301": 2, "é": 3 }, "\uE000": 4 };
+  const expected = '{"A":1,"😀":{"é":2,"é":3},"":4}';
+  assert.equal(canonicalPayload(left), expected);
+  assert.equal(canonicalPayload(right), expected);
+  assert.equal(canonicalPayload({ text: "line\nquote\"", negativeZero: -0, decimal: 1.25 }), '{"decimal":1.25,"negativeZero":0,"text":"line\\nquote\\\""}');
+  assert.equal(canonicalPayload({ 2: "two", 10: "ten" }), '{"10":"ten","2":"two"}');
+  assert.throws(() => canonicalPayload({ invalid: Number.NaN }), /canonical JSON/i);
+});
+
+test("requires explicitly published and usable lead forms", async (t) => {
+  for (const options of [{ formPublished: false }, { formUsable: false }, { omitFormState: true }]) {
+    const value = await fixture(t, options);
+    const request = sales({ media_id: value.staged.media.media_id, sha256: value.staged.media.sha256 });
+    request.payload.campaign_kind = "LEADS_INSTANT_FORM";
+    delete request.payload.ad_set.pixel_id;
+    request.payload.ad_set.lead_gen_form_id = "form-1";
+    delete request.payload.creative.website_url;
+    request.payload.creative.call_to_action = "SIGN_UP";
+    await assert.rejects(
+      value.operations.propose({ actor: "openclaw:user-1", requestId: `request-form-${String(options.formPublished)}`, idempotencyKey: `idempotency-form-${crypto.randomUUID()}`, request }),
+      (error: unknown) => error instanceof OperationError && error.code === "unsupported_campaign_combination",
+    );
+  }
+});
+
+test("compares offset-aware schedules as absolute instants", async (t) => {
+  const valid = await fixture(t);
+  const request = sales({ media_id: valid.staged.media.media_id, sha256: valid.staged.media.sha256 });
+  request.payload.ad_set.start_time = "2026-11-01T01:30:00-04:00";
+  request.payload.ad_set.end_time = "2026-11-01T01:15:00-05:00";
+  assert.equal((await valid.operations.propose({ actor: "openclaw:user-1", requestId: "request-dst-offset", idempotencyKey: "idempotency-dst-offset", request })).created, true);
+
+  for (const [start, end] of [
+    ["2026-01-01T00:00:00+00:00", "2026-01-01T01:00:00+01:00"],
+    ["not-an-instant", "2026-01-01T01:00:00Z"],
+  ]) {
+    const value = await fixture(t);
+    const invalid = sales({ media_id: value.staged.media.media_id, sha256: value.staged.media.sha256 });
+    invalid.payload.ad_set.start_time = start!;
+    invalid.payload.ad_set.end_time = end!;
+    await assert.rejects(value.operations.propose({ actor: "openclaw:user-1", requestId: "request-invalid-offset", idempotencyKey: `idempotency-${crypto.randomUUID()}`, request: invalid }), OperationError);
+  }
+});
+
+test("rejects lifetime campaign budgets without an exact end time before persistence", async (t) => {
+  const value = await fixture(t);
+  const request = sales({ media_id: value.staged.media.media_id, sha256: value.staged.media.sha256 });
+  request.payload.campaign.budget = { kind: "lifetime", value: { amount: "100.00", currency: "USD" } };
+
+  await assert.rejects(
+    value.operations.propose({ actor: "openclaw:user-1", requestId: "request-lifetime", idempotencyKey: "idempotency-lifetime", request }),
+    (error: unknown) => error instanceof OperationError && error.code === "operation_semantics_invalid",
+  );
+  assert.equal(value.db.prepare("SELECT count(*) AS count FROM operations").get()!.count, 0);
+
+  const app = await buildApp({ serviceToken: "service-token", handlers: createOperationHandlers(value.operations, "openclaw:user-1") });
+  t.after(() => app.close());
+  const response = await app.inject({
+    method: "POST", url: "/v1/operations",
+    headers: { authorization: "Bearer service-token", "content-type": "application/json", "x-request-id": "request-lifetime-contract", "idempotency-key": "idempotency-lifetime-contract" },
+    payload: request,
+  });
+  assert.equal(response.statusCode, 400);
+  assert.equal(response.json().code, "validation_error");
+});
+
+test("rejects more than one creative media binding at contract and runtime boundaries", async (t) => {
+  const value = await fixture(t);
+  const second = await value.stage();
+  const request = sales({ media_id: value.staged.media.media_id, sha256: value.staged.media.sha256 });
+  request.payload.creative.media.push({ media_id: second.media.media_id, sha256: second.media.sha256 });
+
+  await assert.rejects(
+    value.operations.propose({ actor: "openclaw:user-1", requestId: "request-multi-media", idempotencyKey: "idempotency-multi-media", request }),
+    (error: unknown) => error instanceof OperationError && error.code === "operation_semantics_invalid",
+  );
+  assert.equal(value.db.prepare("SELECT count(*) AS count FROM operations").get()!.count, 0);
+
+  const app = await buildApp({ serviceToken: "service-token", handlers: createOperationHandlers(value.operations, "openclaw:user-1") });
+  t.after(() => app.close());
+  const response = await app.inject({
+    method: "POST", url: "/v1/operations",
+    headers: { authorization: "Bearer service-token", "content-type": "application/json", "x-request-id": "request-multi-contract", "idempotency-key": "idempotency-multi-contract" },
+    payload: request,
+  });
+  assert.equal(response.statusCode, 400);
+  assert.equal(response.json().code, "validation_error");
+});
+
+test("returns an explicit allowlisted review projection instead of the stored payload", async (t) => {
+  const value = await fixture(t);
+  const request = sales({ media_id: value.staged.media.media_id, sha256: value.staged.media.sha256 });
+  const result = await value.operations.propose({ actor: "openclaw:user-1", requestId: "request-review", idempotencyKey: "idempotency-review", request });
+  const operation = result.operation as unknown as Record<string, unknown>;
+
+  assert.equal("payload" in operation, false);
+  assert.deepEqual(operation.review, request.payload);
+  assert.equal(operation.payload_hash, createHash("sha256").update(canonicalPayload(request.payload)).digest("hex"));
+  assert.equal(operation.next_action, "approve_or_reject");
+});
+
+test("database binds idempotency identity and enforces result and exact-expiry combinations", async (t) => {
+  const { db, operations } = await fixture(t);
+  const request = { type: "configure_monthly_budget", client_id: "client-1", ad_account_id: "act_1", payload: { monthly_budget: { amount: "100.00", currency: "USD" } } } as const;
+  const created = await operations.propose({ actor: "openclaw:user-1", requestId: "request-db-operation", idempotencyKey: "idempotency-db-operation", request });
+  const copy = (id: string, actor: string, status: string, result: string | null, expires: string) => db.prepare(`
+    INSERT INTO operations
+      (id, actor, client_id, ad_account_id, generation_id, operation_type, payload_json, payload_hash,
+       derived_json, status, result_json, created_at, expires_at)
+    SELECT ?, ?, client_id, ad_account_id, generation_id, operation_type, payload_json, payload_hash,
+       derived_json, ?, ?, created_at, ? FROM operations WHERE id = ?
+  `).run(id, actor, status, result, expires, created.operation.operation_id);
+  assert.throws(() => copy("bad-result", "other", "succeeded", null, created.operation.expires_at), /constraint|result/i);
+  assert.throws(() => copy("bad-operation-expiry", "other", "pending", null, "2026-08-19T23:59:59.999Z"), /constraint|expiry/i);
+  copy("forged-operation", "bound-actor", "pending", null, created.operation.expires_at);
+  assert.throws(() => db.prepare(`INSERT INTO operation_idempotency
+    (actor, operation_type, client_id, ad_account_id, idempotency_key, payload_hash, operation_id, created_at)
+    SELECT 'different-actor', operation_type, client_id, ad_account_id, 'different-idempotency-key', payload_hash, id, created_at
+    FROM operations WHERE id = 'forged-operation'`).run(), /constraint|idempotency/i);
 });
 
 test("derives only the three fixed campaign combinations and rejects incompatible form, CTA, media, schedule, and currency inputs", async (t) => {
@@ -231,7 +355,7 @@ test("preserves idempotency across concurrency and restart while rejecting expir
 
   const restarted = createOperationsService({
     db: value.db,
-    mediaRoot: value.mediaRoot,
+    hashMediaFile: (await createMediaService({ db: value.db, dataRoot: join(value.mediaRoot, ".."), mediaRoot: value.mediaRoot, now: () => now })).hashFile,
     now: () => now,
     capabilities: async () => { throw new Error("idempotent reuse must not revalidate"); },
     validateTarget: async () => { throw new Error("idempotent reuse must not revalidate"); },
@@ -281,6 +405,16 @@ test("operation handlers enforce OpenAPI unions and return correlated create, re
   assert.equal(fetched.statusCode, 200);
   assert.equal(fetched.json().request_id, "request-operation-get");
   assert.equal(fetched.json().operation.status, "pending");
+
+  db.prepare("UPDATE integration_generations SET status = 'retired' WHERE id = 'generation-1'").run();
+  const fetchedAfterRotation = await app.inject({
+    method: "GET",
+    url: `/v1/operations/${created.json().operation.operation_id}?client_id=client-1&ad_account_id=act_1`,
+    headers: { authorization: "Bearer service-token", "x-request-id": "request-operation-get-retired" },
+  });
+  assert.equal(fetchedAfterRotation.statusCode, 200);
+  assert.equal(fetchedAfterRotation.json().operation.operation_id, created.json().operation.operation_id);
+  db.prepare("UPDATE integration_generations SET status = 'active' WHERE id = 'generation-1'").run();
 
   const conflict = await app.inject({ method: "POST", url: "/v1/operations", headers, payload: { ...request, payload: { monthly_budget: { amount: "200.00", currency: "USD" } } } });
   assert.equal(conflict.statusCode, 409);

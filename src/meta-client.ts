@@ -27,13 +27,14 @@ export interface MetaRequest {
   path: string;
   query?: Record<string, string | number | boolean | undefined>;
   body?: unknown;
+  form?: FormData;
   scope: MetaScope;
   actor: string;
   correlationId: string;
   operation: string;
 }
 
-export interface MetaPageRequest extends Omit<MetaRequest, "method" | "body"> {}
+export interface MetaPageRequest extends Omit<MetaRequest, "method" | "body" | "form"> {}
 
 export interface AsyncInsightsRequest extends MetaPageRequest {}
 
@@ -126,6 +127,10 @@ function metaFailure(value: unknown): { code: string; transient: boolean } {
   return { code: "upstream_error", transient: false };
 }
 
+function formValue(value: unknown): string {
+  return value !== null && typeof value === "object" ? JSON.stringify(value) : String(value);
+}
+
 async function responseBody(response: Response, signal: AbortSignal): Promise<unknown> {
   if (response.body === null) return null;
   if (signal.aborted) {
@@ -187,6 +192,7 @@ export function createMetaClient(options: MetaClientOptions) {
   }
 
   async function once<T>(request: MetaRequest): Promise<{ data: T; rate: MetaRateEvidence }> {
+    if (request.body !== undefined && request.form !== undefined) throw new Error("Meta request body is ambiguous");
     if (Object.keys(request.query ?? {}).some((name) => /^(?:access_token|app_?secret|appsecret_proof)$/i.test(name))) {
       throw new Error("Reserved Meta query parameter");
     }
@@ -195,10 +201,21 @@ export function createMetaClient(options: MetaClientOptions) {
     for (const [name, value] of Object.entries(request.query ?? {})) {
       if (value !== undefined) url.searchParams.set(name, String(value));
     }
-    url.searchParams.set(
-      "appsecret_proof",
-      createHmac("sha256", credentials.appSecret).update(credentials.accessToken).digest("hex"),
-    );
+    const proof = createHmac("sha256", credentials.appSecret).update(credentials.accessToken).digest("hex");
+    let outboundBody: FormData | undefined;
+    if (request.method === "GET") {
+      url.searchParams.set("appsecret_proof", proof);
+    } else {
+      outboundBody = request.form ?? new FormData();
+      if (outboundBody.has("access_token") || outboundBody.has("appsecret_proof")) throw new Error("Reserved Meta form parameter");
+      if (request.body !== undefined) {
+        if (request.body === null || typeof request.body !== "object" || Array.isArray(request.body)) throw new Error("Invalid Meta write body");
+        for (const [name, value] of Object.entries(request.body)) {
+          if (value !== undefined) outboundBody.append(name, formValue(value));
+        }
+      }
+      outboundBody.append("appsecret_proof", proof);
+    }
 
     await audit(request, "started");
     const controller = new AbortController();
@@ -207,11 +224,8 @@ export function createMetaClient(options: MetaClientOptions) {
     try {
       response = await options.fetch(url, {
         method: request.method,
-        headers: {
-          authorization: `Bearer ${credentials.accessToken}`,
-          ...(request.body === undefined ? {} : { "content-type": "application/json" }),
-        },
-        ...(request.body === undefined ? {} : { body: JSON.stringify(request.body) }),
+        headers: { authorization: `Bearer ${credentials.accessToken}` },
+        ...(outboundBody === undefined ? {} : { body: outboundBody }),
         signal: controller.signal,
       });
     } catch (error) {

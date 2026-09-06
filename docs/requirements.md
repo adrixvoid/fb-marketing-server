@@ -83,7 +83,7 @@ The budget scope is one fixed monthly budget per Ad Account. Each account's Meta
 | ID | Requirement |
 |---|---|
 | SEC-1 | `fb-marketing-server` shall bind only to `127.0.0.1` and accept requests only from OpenClaw carrying a valid dedicated internal service credential. |
-| SEC-2 | Remote access shall terminate at OpenClaw through Tailscale Serve or an authenticated SSH tunnel; `fb-marketing-server` shall not be publicly exposed. |
+| SEC-2 | User access shall terminate at configured OpenClaw outbound chat channels; both local APIs shall remain loopback-only. Tailscale or SSH may provide authenticated administrative shell access to the Mac only. |
 | SEC-3 | Meta access tokens, App Secrets, service credentials, encryption keys, and authorization headers shall not appear in responses, logs, audit records, prompts or tool context, traces, chat, or source control. |
 | SEC-4 | Meta tokens shall be encrypted at rest with a key held in macOS Keychain and separate from the database. |
 | SEC-5 | Exactly one configured channel-scoped owner identity shall approve or reject operations after OpenClaw establishes sender authorization. The LLM shall not possess or invoke this authority. |
@@ -152,7 +152,7 @@ The operational procedure and evidence checklist are defined in the [Meta setup 
 
 ## 10. Explicit non-goals
 
-- Public exposure of `fb-marketing-server`, Tailscale Funnel, a public reverse proxy, or a public token-renewal endpoint.
+- Any user-facing network exposure of `fb-marketing-server` or a public token-renewal endpoint.
 - Exposing Meta credentials to OpenClaw, models, chat, logs, or users.
 - A standard OAuth refresh-token assumption for Meta System User credentials.
 - Transfer of client asset ownership to the agency portfolio.

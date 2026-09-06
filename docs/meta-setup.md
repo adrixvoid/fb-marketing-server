@@ -166,6 +166,19 @@ Complete and accept this read-only proof before enabling approval infrastructure
 
 ## Migrate client by client
 
+The local migration validator enforces the 14-app inventory, exact agency/pilot identifiers, pilot-first batches, one-to-one client/Business ownership, exact account ownership, complete authority, read/currency/timezone/pacing parity, a linked owner-approved all-`PAUSED` canary, sign-off, freeze/reconciliation, cutover, rollback, the full seven-day observation, and retirement order. Start from `test/fixtures/migration-inventory.json`, replace placeholder identifiers with the real non-secret inventory, and keep the manifest and evidence under a mode-`0700` private directory outside Git.
+
+```bash
+EVIDENCE="$HOME/Library/Application Support/fb-marketing-server/migration-evidence.jsonl"
+npm run migration:validate -- /absolute/path/to/inventory.json "$EVIDENCE"
+
+# Record one validator action from an exact local-gateway response on stdin.
+printf '%s\n' '{"action":{"type":"authority","client_id":"client-pilot","business_id":"290166249089842","target_generation":"generation-central-15","old_integrations":["old-01"],"ad_account_id":"act_pilot_a","at":"2026-09-04T00:00:00.000Z"},"gateway_response":{"app_access":true,"token_valid":true,"token_subject":"system_user:agency-1","partner_relationship":true,"assigned_assets":["act_pilot_a"],"assigned_tasks":["ADVERTISE","MANAGE"],"permissions":["ads_read","ads_management"],"endpoint_authority":["campaigns.read","insights.read","campaigns.write"]}}' | \
+  npm run migration:evidence -- /absolute/path/to/inventory.json "$EVIDENCE"
+```
+
+The validator prints one machine-readable blocking gate and next action. It never calls Meta, changes routing, approves an operation, or retires an integration. Each event is generated from one exact discriminated action and validated local-gateway response; unknown or secret-shaped keys/values fail before evidence access. Evidence uses monotonic sequence numbers and a canonical previous-hash/hash chain plus a private anchor, mode `0600`, under a regular mode-`0700` parent. Editing, deleting, reordering, truncating, or relabeling evidence fails closed. Rollback changes only the retained route generation and preserves history and created resources.
+
 - [ ] Select one client based on inventory completeness and operational readiness, not convenience of credential reuse.
 - [ ] Confirm all client-owned assets remain in the client portfolio.
 - [ ] Establish partner sharing and System User assignments for the exact required assets/tasks.

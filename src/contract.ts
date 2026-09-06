@@ -5,6 +5,7 @@ import { OpenAPIBackend, type Context } from "openapi-backend";
 import addFormats from "ajv-formats";
 import { parse } from "yaml";
 import { compileOpenApiSchemas, RequestContractError } from "./openapi-validation.js";
+import { requestId } from "./request-id.js";
 
 export type ContractResponse = {
   statusCode: number;
@@ -63,16 +64,12 @@ export function problem(
   title: string,
   detail: string,
 ): ContractResponse {
-  const suppliedRequestId = context.request.headers["x-request-id"];
-  const requestId =
-    typeof suppliedRequestId === "string" && /^[A-Za-z0-9._:-]{8,128}$/.test(suppliedRequestId)
-      ? suppliedRequestId
-      : crypto.randomUUID();
+  const id = requestId(context.request.headers["x-request-id"]);
   return {
     statusCode,
     mediaType: "application/problem+json",
     headers: {
-      "x-request-id": requestId,
+      "x-request-id": id,
       ...(statusCode === 401 ? { "www-authenticate": "Bearer" } : {}),
     },
     body: {
@@ -81,7 +78,7 @@ export function problem(
       status: statusCode,
       code,
       detail,
-      request_id: requestId,
+      request_id: id,
     },
   };
 }

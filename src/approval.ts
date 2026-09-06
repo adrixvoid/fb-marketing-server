@@ -7,11 +7,15 @@ import type { components } from "./generated/openapi.js";
 import { appendAudit, transaction } from "./db.js";
 import type { SecretProvider } from "./secrets.js";
 import { resolveScope } from "./scope.js";
+import { requestId } from "./request-id.js";
+import { operationExecutionView, operationNextAction, operationReview } from "./operations.js";
 
 type Operation = components["schemas"]["Operation"];
 type Decision = "approved" | "rejected";
 const OWNER_PATTERN = /^[A-Za-z0-9._-]{1,64}:[A-Za-z0-9._-]{1,128}$/;
 const DEFAULT_FRESHNESS_SECONDS = 300;
+const DEFAULT_RATE_LIMIT = { windowSeconds: 60, globalLimit: 120, ownerLimit: 60 } as const;
+const FUTURE_SKEW_SECONDS = 0;
 
 export function validOwnerIdentity(value: string): boolean {
   return OWNER_PATTERN.test(value);
@@ -22,8 +26,9 @@ export class ApprovalError extends Error {
 
   constructor(
     message: string,
-    readonly status: 403 | 404 | 409 | 410,
-    readonly code: "forbidden" | "not_found" | "client_account_mismatch" | "operation_stale" | "operation_already_resolved" | "operation_expired",
+    readonly status: 400 | 403 | 404 | 409 | 410 | 429,
+    readonly code: "validation_error" | "forbidden" | "not_found" | "client_account_mismatch" | "operation_stale" | "operation_already_resolved" | "operation_expired" | "rate_limited",
+    readonly retryAfterSeconds?: number,
   ) {
     super(message);
   }
@@ -136,25 +141,28 @@ const operationSql = `
 function storedOperation(db: DatabaseSync, operationId: string): Operation {
   const row = db.prepare(operationSql).get(operationId) as unknown as StoredOperationRow | undefined;
   if (row === undefined) throw new ApprovalError("Operation was not found", 404, "not_found");
-  const scope = resolveScope(db, { clientId: row.client_id, adAccountId: row.ad_account_id });
-  return {
+  const scope = db.prepare(`SELECT c.name AS client_name, a.name AS account_name, a.currency, a.timezone
+    FROM clients c JOIN ad_accounts a ON a.client_id = c.id WHERE c.id = ? AND a.id = ?`)
+    .get(row.client_id, row.ad_account_id) as { client_name: string; account_name: string; currency: string | null; timezone: string | null };
+  return operationExecutionView(db, {
     operation_id: row.id,
     type: row.operation_type,
     status: row.status,
     scope: {
-      client_id: scope.clientId, client_name: scope.clientName,
-      ad_account_id: scope.adAccountId, ad_account_name: scope.adAccountName,
-      ...(scope.currency === undefined ? {} : { currency: scope.currency }),
-      ...(scope.timezone === undefined ? {} : { timezone: scope.timezone }),
+      client_id: row.client_id, client_name: scope.client_name,
+      ad_account_id: row.ad_account_id, ad_account_name: scope.account_name,
+      ...(scope.currency === null ? {} : { currency: scope.currency }),
+      ...(scope.timezone === null ? {} : { timezone: scope.timezone }),
     },
     integration_generation: row.generation_id,
     payload_hash: row.payload_hash,
-    payload: JSON.parse(row.payload_json),
+    review: operationReview(row.operation_type, JSON.parse(row.payload_json)),
+    next_action: operationNextAction(row.status),
     created_at: row.created_at,
     expires_at: row.expires_at,
     decision: row.decision_value === null ? null : { decision: row.decision_value, decided_at: row.decided_at!, owner_identity: row.owner_identity! },
     result: row.result_json === null ? null : JSON.parse(row.result_json),
-  } as Operation;
+  } as Operation);
 }
 
 interface ApprovalOptions {
@@ -163,10 +171,12 @@ interface ApprovalOptions {
   ownerIdentity: string;
   revalidate(input: { actor: string; requestId: string; operationId: string }): Promise<Operation>;
   cleanupOperationMedia(operationId: string, status: "consumed" | "expired" | "invalid"): Promise<number>;
+  executeApproved?(input: { operationId: string; actor: string; requestId: string }): Promise<Operation>;
   now?: () => Date;
   freshnessSeconds?: number;
   proofSecretName?: string;
   testHooks?: { beforeDecisionCommit?: () => void };
+  rateLimit?: { windowSeconds: number; globalLimit: number; ownerLimit: number };
 }
 
 interface DecideInput {
@@ -188,21 +198,32 @@ export function createApprovalService({
   ownerIdentity,
   revalidate,
   cleanupOperationMedia,
+  executeApproved,
   now = () => new Date(),
   freshnessSeconds = DEFAULT_FRESHNESS_SECONDS,
   proofSecretName = "owner-proof-hmac-key",
   testHooks = {},
+  rateLimit = DEFAULT_RATE_LIMIT,
 }: ApprovalOptions) {
   if (!validOwnerIdentity(ownerIdentity)) throw new Error("Exactly one channel-scoped owner identity is required");
   if (!Number.isSafeInteger(freshnessSeconds) || freshnessSeconds < 1 || freshnessSeconds > 900) throw new Error("Invalid proof freshness");
+  if ([rateLimit.windowSeconds, rateLimit.globalLimit, rateLimit.ownerLimit].some((value) => !Number.isSafeInteger(value) || value < 1)) {
+    throw new Error("Invalid approval rate limit");
+  }
+
+  function assertFresh(parsed: ParsedProof, at: Date): void {
+    const current = Math.floor(at.getTime() / 1000);
+    if (parsed.ownerIdentity !== ownerIdentity || parsed.issuedAt > current + FUTURE_SKEW_SECONDS || current - parsed.issuedAt > freshnessSeconds) {
+      throw new ApprovalError("Owner proof is forbidden or expired", 403, "forbidden");
+    }
+  }
 
   async function verify(input: DecideInput): Promise<ParsedProof> {
     const parsed = parseProof(input.proof);
-    const current = Math.floor(now().getTime() / 1000);
-    if (parsed.ownerIdentity !== ownerIdentity || input.actor !== ownerIdentity || parsed.issuedAt > current || current - parsed.issuedAt > freshnessSeconds) {
-      throw new ApprovalError("Owner proof is forbidden or expired", 403, "forbidden");
-    }
+    if (input.actor !== ownerIdentity) throw new ApprovalError("Owner proof is forbidden or expired", 403, "forbidden");
+    assertFresh(parsed, now());
     const secret = await secrets.get(proofSecretName);
+    assertFresh(parsed, now());
     if (secret === undefined) throw new ApprovalError("Owner proof is unavailable", 403, "forbidden");
     let expected: Buffer;
     try {
@@ -219,6 +240,47 @@ export function createApprovalService({
       throw new ApprovalError("Owner proof signature is invalid", 403, "forbidden");
     }
     return parsed;
+  }
+
+  function purgeExpiredNonces(at = now()): number {
+    return transaction(db, () => {
+      const before = Math.floor(at.getTime() / 1000);
+      db.prepare("UPDATE approval_nonce_maintenance SET purge_before = ? WHERE id = 1").run(before);
+      const removed = Number(db.prepare(`DELETE FROM proof_nonces
+        WHERE purge_after < ? AND NOT EXISTS (SELECT 1 FROM approval_decisions d WHERE d.nonce = proof_nonces.nonce)`)
+        .run(before).changes);
+      db.prepare("UPDATE approval_nonce_maintenance SET purge_before = 0 WHERE id = 1").run();
+      return removed;
+    });
+  }
+
+  function admitAttempt(at: Date): number | undefined {
+    const current = Math.floor(at.getTime() / 1000);
+    const windowStart = current - (current % rateLimit.windowSeconds);
+    return transaction(db, () => {
+      const entries = [
+        { scope: "global", identity: "*", limit: rateLimit.globalLimit },
+        { scope: "owner", identity: ownerIdentity, limit: rateLimit.ownerLimit },
+      ] as const;
+      const states = entries.map((entry) => {
+        const stored = db.prepare("SELECT window_started_at, admitted_count, rejected_count FROM approval_rate_limits WHERE scope = ? AND identity = ?")
+          .get(entry.scope, entry.identity) as { window_started_at: number; admitted_count: number; rejected_count: number } | undefined;
+        return stored === undefined || stored.window_started_at !== windowStart
+          ? { ...entry, admitted: 0, rejected: 0 }
+          : { ...entry, admitted: stored.admitted_count, rejected: stored.rejected_count };
+      });
+      const limited = states.some(({ admitted, limit }) => admitted >= limit);
+      const save = db.prepare(`INSERT INTO approval_rate_limits
+        (scope, identity, window_started_at, admitted_count, rejected_count, last_rejected_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(scope) DO UPDATE SET identity = excluded.identity, window_started_at = excluded.window_started_at,
+          admitted_count = excluded.admitted_count, rejected_count = excluded.rejected_count,
+          last_rejected_at = excluded.last_rejected_at`);
+      for (const state of states) {
+        save.run(state.scope, state.identity, windowStart, state.admitted + (limited ? 0 : 1), state.rejected + (limited ? 1 : 0), limited ? current : null);
+      }
+      return limited ? Math.max(1, windowStart + rateLimit.windowSeconds - current) : undefined;
+    });
   }
 
   function linkedAudit(row: StoredOperationRow, input: DecideInput, outcome: "succeeded" | "failed", eventType: "decision" | "revalidation", errorCode?: string, decisionId?: string) {
@@ -239,16 +301,17 @@ export function createApprovalService({
 
   async function decideInternal(input: DecideInput): Promise<Operation> {
     const proof = await verify(input);
-    const consumedAt = now();
     let preliminary: { row: StoredOperationRow; outcome: "proceed" | "same" | "expired" | "resolved" | "scope" };
     try {
       preliminary = transaction(db, () => {
+        const consumedAt = now();
+        assertFresh(proof, consumedAt);
         const row = db.prepare(operationSql).get(input.operationId) as unknown as StoredOperationRow | undefined;
         if (row === undefined) throw new ApprovalError("Operation was not found", 404, "not_found");
         db.prepare(`INSERT INTO proof_nonces
-          (nonce, owner_identity, operation_id, decision, body_hash, issued_at, consumed_at, correlation_id)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
-          .run(proof.nonce, ownerIdentity, input.operationId, input.decision, bodyHash(input.body), proof.issuedAt, consumedAt.toISOString(), input.requestId);
+          (nonce, owner_identity, operation_id, decision, body_hash, issued_at, consumed_at, correlation_id, purge_after)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+          .run(proof.nonce, ownerIdentity, input.operationId, input.decision, bodyHash(input.body), proof.issuedAt, consumedAt.toISOString(), input.requestId, proof.issuedAt + freshnessSeconds + FUTURE_SKEW_SECONDS);
         if (row.client_id !== input.clientId || row.ad_account_id !== input.adAccountId) return { row, outcome: "scope" };
         if (consumedAt.getTime() >= Date.parse(row.expires_at)) {
           if (row.status === "pending") db.prepare("UPDATE operations SET status = 'expired' WHERE id = ? AND status = 'pending'").run(row.id);
@@ -295,8 +358,9 @@ export function createApprovalService({
     }
 
     const decisionId = randomUUID();
-    const decidedAt = now();
+    let decidedAt!: Date;
     transaction(db, () => {
+      decidedAt = now();
       const current = db.prepare(operationSql).get(input.operationId) as unknown as StoredOperationRow;
       if (current.decision_value !== null) {
         if (current.decision_value !== input.decision) throw new ApprovalError("Operation is already resolved", 409, "operation_already_resolved");
@@ -304,6 +368,19 @@ export function createApprovalService({
         return;
       }
       if (current.status !== "pending") throw new ApprovalError("Operation is already resolved", 409, "operation_already_resolved");
+      if (decidedAt.getTime() >= Date.parse(current.expires_at)) {
+        db.prepare("UPDATE operations SET status = 'expired' WHERE id = ? AND status = 'pending'").run(current.id);
+        linkedAudit(current, input, "failed", "revalidation", "operation_expired");
+        return;
+      }
+      try {
+        const authoritative = resolveScope(db, { clientId: current.client_id, adAccountId: current.ad_account_id }, { task: "ADVERTISE", permission: "ads_management" });
+        if (authoritative.generationId !== current.generation_id) throw new Error("stale generation");
+      } catch {
+        db.prepare("UPDATE operations SET status = 'stale' WHERE id = ? AND status = 'pending'").run(current.id);
+        linkedAudit(current, input, "failed", "revalidation", "operation_stale");
+        return;
+      }
       db.prepare(`INSERT INTO approval_decisions
         (id, operation_id, payload_hash, decision, owner_identity, decided_at, nonce, correlation_id)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
@@ -312,6 +389,19 @@ export function createApprovalService({
       linkedAudit(current, input, "succeeded", "decision", undefined, decisionId);
       testHooks.beforeDecisionCommit?.();
     });
+    const afterCommit = db.prepare(operationSql).get(input.operationId) as unknown as StoredOperationRow;
+    if (afterCommit.status === "expired") {
+      await cleanupOperationMedia(input.operationId, "expired");
+      const error = new ApprovalError("Operation has expired", 410, "operation_expired");
+      error.auditRecorded = true;
+      throw error;
+    }
+    if (afterCommit.status === "stale") {
+      await cleanupOperationMedia(input.operationId, "invalid");
+      const error = new ApprovalError("Operation revalidation failed", 409, "operation_stale");
+      error.auditRecorded = true;
+      throw error;
+    }
     if (input.decision === "rejected") await cleanupOperationMedia(input.operationId, "consumed");
     return storedOperation(db, input.operationId);
   }
@@ -338,46 +428,65 @@ export function createApprovalService({
   }
 
   async function decide(input: DecideInput): Promise<Operation> {
+    purgeExpiredNonces();
+    const retryAfter = admitAttempt(now());
+    if (retryAfter !== undefined) {
+      const error = new ApprovalError("Owner decision rate limit exceeded", 429, "rate_limited", retryAfter);
+      error.auditRecorded = true;
+      throw error;
+    }
     try {
-      return await decideInternal(input);
+      const operation = await decideInternal(input);
+      if (input.decision === "approved" && executeApproved !== undefined) {
+        const executed = await executeApproved({ operationId: input.operationId, actor: input.actor, requestId: input.requestId });
+        if (executed.status === "stale") throw new ApprovalError("Operation revalidation failed", 409, "operation_stale");
+        if (executed.status === "expired") throw new ApprovalError("Operation has expired", 410, "operation_expired");
+        return executed;
+      }
+      return operation;
     } catch (error) {
       if (!(error instanceof ApprovalError) || !error.auditRecorded) auditFailure(input, error);
       throw error;
     }
   }
 
-  return { decide };
+  purgeExpiredNonces();
+  return { decide, purgeExpiredNonces };
 }
 
 type ApprovalService = ReturnType<typeof createApprovalService>;
 
-function requestId(context: Context): string {
-  const value = context.request.headers["x-request-id"];
-  return typeof value === "string" && /^[A-Za-z0-9._:-]{8,128}$/.test(value) ? value : randomUUID();
-}
-
-function approvalProblem(context: Context, error: ApprovalError): ContractResponse {
-  const id = requestId(context);
+function approvalProblem(id: string, error: ApprovalError): ContractResponse {
   return {
     statusCode: error.status,
     mediaType: "application/problem+json",
-    headers: { "x-request-id": id },
+    headers: { "x-request-id": id, ...(error.status === 429 ? { "retry-after": String(error.retryAfterSeconds) } : {}) },
     body: {
       type: `urn:fb-marketing-server:${error.code}`,
-      title: error.status === 403 ? "Forbidden" : error.status === 404 ? "Not found" : error.status === 410 ? "Gone" : "Conflict",
+      title: error.status === 400 ? "Bad request" : error.status === 403 ? "Forbidden" : error.status === 404 ? "Not found" : error.status === 410 ? "Gone" : error.status === 429 ? "Rate limited" : "Conflict",
       status: error.status,
       code: error.code,
       detail: error.message,
       request_id: id,
+      ...(
+        error.status === 410 || error.code === "operation_stale" || error.code === "client_account_mismatch"
+          ? { next_action: "retry_new_operation" }
+          : error.code === "operation_already_resolved" ? { next_action: "no_action" } : {}
+      ),
     },
   };
 }
 
 export function createApprovalHandlers(service: ApprovalService, actor: string): HandlerMap {
   const handler = (decision: Decision) => async (context: Context, request: FastifyRequest) => {
-    const id = requestId(context);
+    const id = requestId(context.request.headers["x-request-id"]);
     try {
-      if (Number(request.headers["content-length"] ?? 0) !== 0) throw new ApprovalError("Owner command body must be empty", 403, "forbidden");
+      const contentLength = request.headers["content-length"];
+      if (
+        request.headers["transfer-encoding"] !== undefined ||
+        contentLength !== undefined && (Array.isArray(contentLength) || contentLength !== "0") ||
+        request.body !== undefined
+      ) throw new ApprovalError("Owner command body must be empty", 400, "validation_error");
       const operation = await service.decide({
         actor,
         requestId: id,
@@ -391,13 +500,13 @@ export function createApprovalHandlers(service: ApprovalService, actor: string):
         proof: String(context.request.headers["x-openclaw-owner-command"] ?? ""),
       });
       return {
-        statusCode: decision === "approved" ? 202 : 200,
+          statusCode: decision === "approved" && !["succeeded", "failed"].includes(operation.status) ? 202 : 200,
         mediaType: "application/json",
         headers: { "x-request-id": id },
         body: { request_id: id, operation },
       } satisfies ContractResponse;
     } catch (error) {
-      if (error instanceof ApprovalError) return approvalProblem(context, error);
+      if (error instanceof ApprovalError) return approvalProblem(id, error);
       throw error;
     }
   };

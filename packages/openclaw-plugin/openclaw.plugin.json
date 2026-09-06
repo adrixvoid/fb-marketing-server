@@ -1,0 +1,32 @@
+{
+  "id": "fb-marketing-server",
+  "name": "Meta Ads Local Gateway",
+  "description": "Curated Meta Ads tools and deterministic owner commands for the loopback gateway.",
+  "version": "0.1.0",
+  "contracts": {
+    "tools": [
+      "list_scopes",
+      "integration_status",
+      "get_capabilities",
+      "list_campaigns",
+      "query_insights",
+      "budget_summary",
+      "upload_chat_media",
+      "propose_operation",
+      "get_operation"
+    ]
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["baseUrl", "keychainService", "serviceTokenAccount", "ownerProofAccount", "attachmentRoots"],
+    "properties": {
+      "baseUrl": { "type": "string", "pattern": "^http://127\\.0\\.0\\.1(?::[1-9][0-9]{0,4})?/?$" },
+      "keychainService": { "type": "string", "minLength": 1 },
+      "serviceTokenAccount": { "type": "string", "minLength": 1 },
+      "ownerProofAccount": { "type": "string", "minLength": 1 },
+      "attachmentRoots": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1 },
+      "timeoutMs": { "type": "integer", "minimum": 1000, "maximum": 30000 }
+    }
+  }
+}

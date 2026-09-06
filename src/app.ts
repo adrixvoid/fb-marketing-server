@@ -3,6 +3,7 @@ import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
 import type { Context, HandlerMap } from "openapi-backend";
 import { createContract, problem, type ContractResponse } from "./contract.js";
 import { RequestContractError } from "./openapi-validation.js";
+import { requestId } from "./request-id.js";
 
 export type AppOptions = {
   serviceToken: string;
@@ -28,11 +29,11 @@ export async function buildApp({ serviceToken, now = () => new Date(), handlers 
   ) as HandlerMap;
   contract.register({
     getHealth: (context: Context) => {
-      const requestId = String(context.request.headers["x-request-id"] ?? crypto.randomUUID());
+      const id = requestId(context.request.headers["x-request-id"]);
       return {
         statusCode: 200,
         mediaType: "application/json",
-        headers: { "x-request-id": requestId },
+        headers: { "x-request-id": id },
         body: { status: "ok", time: now().toISOString() },
       } satisfies ContractResponse;
     },
@@ -206,10 +207,6 @@ function internalError(id: string): ContractResponse {
       request_id: id,
     },
   };
-}
-
-function requestId(value: string | string[] | undefined): string {
-  return typeof value === "string" && /^[A-Za-z0-9._:-]{8,128}$/.test(value) ? value : crypto.randomUUID();
 }
 
 function normalizeHeaders(headers: Record<string, string> | undefined): Record<string, string> {

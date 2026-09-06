@@ -1,5 +1,9 @@
-import { createRuntime, runtimeEnvironment } from "./runtime.js";
+import { createRuntime, loadProductionEnvironment } from "./runtime.js";
+import { MacOSKeychainSecretProvider } from "./secrets.js";
+import { registerShutdownHandlers } from "./shutdown.js";
 
-const { serviceToken, ownerIdentity, port } = runtimeEnvironment(process.env);
-const app = await createRuntime({ serviceToken, ownerIdentity });
+const secrets = new MacOSKeychainSecretProvider("fb-marketing-server");
+const { serviceToken, ownerIdentity, port } = await loadProductionEnvironment(secrets, process.env);
+const app = await createRuntime({ serviceToken, ownerIdentity, secretProvider: secrets });
+registerShutdownHandlers(app);
 await app.listen({ host: "127.0.0.1", port });

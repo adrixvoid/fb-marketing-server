@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { chmod, mkdir, mkdtemp, rm, stat, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { openDatabase } from "../src/db.js";
-import { defaultRuntimePaths, createRuntime, runtimeEnvironment } from "../src/runtime.js";
+import { defaultRuntimePaths, createRuntime, loadProductionEnvironment, runtimeEnvironment } from "../src/runtime.js";
 import { encryptCredential, type SecretProvider } from "../src/secrets.js";
+import { signOwnerProof } from "../src/approval.js";
+import { canonicalPayload } from "../src/operations.js";
 
 class FakeSecrets implements SecretProvider {
   readonly values = new Map<string, string>();
@@ -106,6 +109,17 @@ test("runtime environment requires the documented service token and one channel-
   assert.throws(() => runtimeEnvironment({ OPENCLAW_SERVICE_TOKEN: "service-token", OPENCLAW_OWNER_IDENTITY: "discord:user-1", PORT: "0" }), /Invalid PORT/);
 });
 
+test("production environment loads service authorization from Keychain rather than process environment", async () => {
+  const secrets = new FakeSecrets();
+  secrets.values.set("openclaw-service-token", "service-token");
+  secrets.values.set("openclaw-owner-identity", "discord:user-1");
+  assert.deepEqual(await loadProductionEnvironment(secrets, { PORT: "3100", OPENCLAW_SERVICE_TOKEN: "ignored-canary" }), {
+    serviceToken: "service-token",
+    ownerIdentity: "discord:user-1",
+    port: 3100,
+  });
+});
+
 test("runtime decrypts scoped credentials just in time, audits Meta, and closes the DB on shutdown", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "fb-marketing-server-runtime-seeded-"));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -197,6 +211,101 @@ test("runtime closes the database when application startup fails", async (t) => 
     /startup failed/,
   );
   assert.equal(closed, true);
+});
+
+test("runtime executes an approved local monthly budget through the owner-command route", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "fb-marketing-server-runtime-execution-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, "state.sqlite");
+  const secrets = new FakeSecrets();
+  const proofSecret = Buffer.alloc(32, 6).toString("base64");
+  await secrets.create("owner-proof-hmac-key", proofSecret);
+  const db = openDatabase(path, root);
+  db.exec(`
+    INSERT INTO clients (id, name, portfolio_id) VALUES ('client-1', 'Client One', 'portfolio-1');
+    INSERT INTO integrations (id, name, meta_app_id, state) VALUES ('integration-1', 'App', 'app-1', 'active');
+    INSERT INTO integration_generations (id, integration_id, generation, status, validated_at)
+      VALUES ('generation-1', 'integration-1', '1', 'active', '2026-08-19T12:00:00.000Z');
+    INSERT INTO ad_accounts (id, client_id, name, currency, timezone)
+      VALUES ('act_1', 'client-1', 'Account One', 'USD', 'America/New_York');
+    INSERT INTO scope_mappings
+      (client_id, ad_account_id, generation_id, active, app_authorized, subject_authorized, partner_authorized, asset_authorized, granted_tasks)
+      VALUES ('client-1', 'act_1', 'generation-1', 1, 1, 1, 1, 1, '["ADVERTISE"]');
+    INSERT INTO encrypted_credentials
+      (id, generation_id, subject_id, key_ref, envelope_version, ciphertext, iv, auth_tag, scopes, status, validated_at)
+      VALUES ('credential-1', 'generation-1', 'subject-1', 'key', 1, 'cipher', 'iv', 'tag', '["ads_management"]', 'active', '2026-08-19T12:00:00.000Z');
+  `);
+  db.close();
+  const at = new Date("2026-08-19T12:00:00.000Z");
+  const app = await createRuntime({
+    serviceToken: "service-token", ownerIdentity: "discord:user-1", dataRoot: root, databasePath: path,
+    secretProvider: secrets, cursorKey: Buffer.alloc(32, 7), now: () => at,
+    fetch: async () => { throw new Error("local monthly budget must not call Meta"); },
+  });
+  t.after(() => app.close());
+  const headers = { authorization: "Bearer service-token", "content-type": "application/json", "x-request-id": "request-runtime-proposal", "idempotency-key": "runtime-execution-key" };
+  const proposed = await app.inject({ method: "POST", url: "/v1/operations", headers, payload: {
+    type: "configure_monthly_budget", client_id: "client-1", ad_account_id: "act_1",
+    payload: { monthly_budget: { amount: "321.09", currency: "USD" } },
+  } });
+  assert.equal(proposed.statusCode, 201);
+  const operationId = proposed.json().operation.operation_id as string;
+  const approvePath = `/v1/operations/${operationId}/approve?client_id=client-1&ad_account_id=act_1`;
+  const proof = signOwnerProof({
+    secret: proofSecret, ownerIdentity: "discord:user-1", decision: "approved", operationId,
+    method: "POST", path: approvePath, body: Buffer.alloc(0), issuedAt: at, nonce: Buffer.alloc(16, 8),
+  });
+  const approved = await app.inject({ method: "POST", url: approvePath, headers: {
+    authorization: "Bearer service-token", "x-request-id": "request-runtime-approval", "x-openclaw-owner-command": proof,
+  } });
+
+  assert.equal(approved.statusCode, 200);
+  assert.equal(approved.json().operation.status, "succeeded");
+  await app.close();
+  const verification = openDatabase(path, root);
+  assert.deepEqual({ ...verification.prepare("SELECT amount_minor, currency FROM budgets").get()! }, { amount_minor: 32109, currency: "USD" });
+  assert.deepEqual(verification.prepare(`SELECT a.logical_operation, a.correlation_id FROM operation_execution_audit_links l
+    JOIN audit_log a ON a.id = l.audit_id WHERE l.event_type = 'execution' ORDER BY a.logical_operation`).all()
+    .map(({ logical_operation, correlation_id }) => [String(logical_operation), String(correlation_id)]), [
+      ["execute_operation", "request-runtime-approval"],
+      ["execution_claim", "request-runtime-approval"],
+      ["execution_result", "request-runtime-approval"],
+      ["execution_step_intent", "request-runtime-approval"],
+      ["execution_step_outcome", "request-runtime-approval"],
+    ]);
+  const recoveryPayload = canonicalPayload({ monthly_budget: { amount: "999.99", currency: "USD" } });
+  const recoveryHash = createHash("sha256").update(recoveryPayload).digest("hex");
+  verification.prepare(`INSERT INTO operations
+    (id, actor, client_id, ad_account_id, generation_id, operation_type, payload_json, payload_hash,
+     status, created_at, expires_at)
+    VALUES ('operation-recovery', 'openclaw', 'client-1', 'act_1', 'generation-1', 'configure_monthly_budget', ?, ?,
+      'pending', ?, ?)`)
+    .run(recoveryPayload, recoveryHash, at.toISOString(), "2026-08-20T00:00:00.000Z");
+  verification.prepare(`INSERT INTO proof_nonces
+    (nonce, owner_identity, operation_id, decision, body_hash, issued_at, consumed_at, correlation_id, purge_after)
+    VALUES ('RRRRRRRRRRRRRRRRRRRRRR', 'discord:user-1', 'operation-recovery', 'approved', ?, 1, ?, 'request-recovery', 301)`)
+    .run("0".repeat(64), at.toISOString());
+  verification.prepare(`INSERT INTO approval_decisions
+    (id, operation_id, payload_hash, decision, owner_identity, decided_at, nonce, correlation_id)
+    VALUES ('decision-recovery', 'operation-recovery', ?, 'approved', 'discord:user-1', ?, 'RRRRRRRRRRRRRRRRRRRRRR', 'request-recovery')`)
+    .run(recoveryHash, at.toISOString());
+  verification.prepare(`INSERT INTO operation_executions
+    (id, operation_id, decision_id, payload_hash, status, claimed_at, correlation_id)
+    VALUES ('execution-recovery', 'operation-recovery', 'decision-recovery', ?, 'running', ?, 'request-recovery')`)
+    .run(recoveryHash, at.toISOString());
+  verification.prepare("UPDATE operations SET status = 'executing' WHERE id = 'operation-recovery'").run();
+  verification.close();
+
+  const restarted = await createRuntime({
+    serviceToken: "service-token", ownerIdentity: "discord:user-1", dataRoot: root, databasePath: path,
+    secretProvider: secrets, cursorKey: Buffer.alloc(32, 7), now: () => at,
+    fetch: async () => { throw new Error("local monthly budget recovery must not call Meta"); },
+  });
+  await restarted.close();
+  const recovered = openDatabase(path, root);
+  assert.deepEqual({ ...recovered.prepare("SELECT amount_minor, currency FROM budgets").get()! }, { amount_minor: 99999, currency: "USD" });
+  assert.equal(recovered.prepare("SELECT status FROM operations WHERE id = 'operation-recovery'").get()!.status, "succeeded");
+  recovered.close();
 });
 
 test("runtime rejects a symlinked data root without changing its target permissions", async (t) => {

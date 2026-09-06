@@ -112,6 +112,54 @@ test("Meta requests reject credential-shaped query parameters before dispatch", 
   assert.equal(fixture.credentialReads(), 0);
 });
 
+test("Meta writes preserve multipart media bodies without forcing a JSON content type", async () => {
+  let sentUrl = "";
+  let sentBody: BodyInit | null | undefined;
+  let contentType: string | null = "missing";
+  const fixture = client(async (input, init) => {
+    sentUrl = String(input);
+    sentBody = init?.body;
+    contentType = new Headers(init?.headers).get("content-type");
+    return json({ id: "video-1" });
+  });
+  const form = new FormData();
+  form.append("source", new Blob([Buffer.from("video-bytes")], { type: "video/mp4" }), "creative.mp4");
+
+  await fixture.instance.request({
+    method: "POST", path: "/act_1/advideos", form, scope, actor: "owner",
+    correlationId: "request-video-upload", operation: "execute_video",
+  });
+
+  assert.equal(sentBody, form);
+  assert.equal(contentType, null);
+  assert.equal(new URL(sentUrl).searchParams.get("appsecret_proof"), null);
+  assert.equal(form.get("appsecret_proof"), createHmac("sha256", "APP-SECRET-CANARY").update("TOKEN-CANARY").digest("hex"));
+  assert.equal(form.get("access_token"), null);
+});
+
+test("Meta JSON writes use form fields and keep credentials out of the URL and audit", async () => {
+  let sentUrl = "";
+  let sentBody: BodyInit | null | undefined;
+  const fixture = client(async (input, init) => {
+    sentUrl = String(input);
+    sentBody = init?.body;
+    return json({ id: "campaign-1" });
+  });
+
+  await fixture.instance.request({
+    method: "POST", path: "/act_1/campaigns", body: { name: "Campaign", status: "PAUSED", special_ad_categories: [] },
+    scope, actor: "owner", correlationId: "request-campaign", operation: "execute_campaign",
+  });
+
+  assert.ok(sentBody instanceof FormData);
+  assert.equal(sentBody.get("name"), "Campaign");
+  assert.equal(sentBody.get("status"), "PAUSED");
+  assert.equal(sentBody.get("special_ad_categories"), "[]");
+  assert.equal(new URL(sentUrl).searchParams.size, 0);
+  assert.equal(sentBody.get("appsecret_proof"), createHmac("sha256", "APP-SECRET-CANARY").update("TOKEN-CANARY").digest("hex"));
+  assert.doesNotMatch(JSON.stringify(fixture.audits), /TOKEN-CANARY|APP-SECRET-CANARY|appsecret_proof|authorization/i);
+});
+
 test("Meta reads use Retry-After for bounded transient retries while writes are never retried", async () => {
   let reads = 0;
   const readFixture = client(async () => {

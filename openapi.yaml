@@ -457,6 +457,10 @@ paths:
       summary: Approve and execute an operation
       description: |
         OWNER-COMMAND ONLY through deterministic `/approve-ad`, outside model dispatch.
+        The request has no body: Transfer-Encoding, non-canonical/nonzero Content-Length,
+        or any parsed body is rejected before decision processing.
+        Durable global and owner rate limits reject excess attempts before proof processing
+        with 429 and Retry-After.
         Approval is accepted only while now < expires_at; equality is expired. Before
         at-most-once execution, scope, budget, Meta authority, integration generation,
         and bound media hashes are revalidated. Decision and execution are audited.
@@ -513,6 +517,10 @@ paths:
       summary: Reject an operation
       description: |
         OWNER-COMMAND ONLY through deterministic `/reject-ad`, outside model dispatch.
+        The request has no body: Transfer-Encoding, non-canonical/nonzero Content-Length,
+        or any parsed body is rejected before decision processing.
+        Durable global and owner rate limits reject excess attempts before proof processing
+        with 429 and Retry-After.
         Rejection is separate from approval, valid only while now < expires_at,
         idempotent, immutable, audited, and permanently prevents execution.
       operationId: rejectOperation
@@ -546,6 +554,8 @@ paths:
           $ref: "#/components/responses/OperationLifecycleConflict"
         "410":
           $ref: "#/components/responses/Gone"
+        "429":
+          $ref: "#/components/responses/RateLimited"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -1644,6 +1654,19 @@ components:
       type: object
       additionalProperties: false
       required: [campaign_kind, campaign, ad_set, creative, ad]
+      allOf:
+        - if:
+            properties:
+              campaign:
+                properties:
+                  budget:
+                    properties: { kind: { const: lifetime } }
+                    required: [kind]
+                required: [budget]
+            required: [campaign]
+          then:
+            properties:
+              ad_set: { required: [end_time] }
       properties:
         campaign_kind:
           $ref: "#/components/schemas/CampaignKind"
@@ -1749,7 +1772,7 @@ components:
         media:
           type: array
           minItems: 1
-          maxItems: 10
+          maxItems: 1
           uniqueItems: true
           items: { $ref: "#/components/schemas/MediaBinding" }
     MediaBinding:
@@ -1860,7 +1883,8 @@ components:
           scope,
           integration_generation,
           payload_hash,
-          payload,
+          review,
+          next_action,
           created_at,
           expires_at,
         ]
@@ -1871,7 +1895,8 @@ components:
         scope: { $ref: "#/components/schemas/ResolvedScope" }
         integration_generation: { $ref: "#/components/schemas/Identifier" }
         payload_hash: { type: string, pattern: "^[a-f0-9]{64}$" }
-        payload: {}
+        review: { $ref: "#/components/schemas/OperationReview" }
+        next_action: { $ref: "#/components/schemas/NextAction" }
         created_at: { type: string, format: date-time }
         expires_at:
           type: string
@@ -1885,6 +1910,15 @@ components:
             ]
         result:
           oneOf: [{ type: "null" }, { type: object }]
+    OperationReview:
+      oneOf:
+        - { $ref: "#/components/schemas/CampaignBundleProposal" }
+        - { $ref: "#/components/schemas/UpdateObjectPayload" }
+        - { $ref: "#/components/schemas/ChangeDeliveryPayload" }
+        - { $ref: "#/components/schemas/MonthlyBudgetPayload" }
+    NextAction:
+      type: string
+      enum: [approve_or_reject, wait, reconcile_manually_no_automatic_replay, retry_new_operation, fix_input, no_action]
     TypedOperation:
       oneOf:
         [
@@ -1908,12 +1942,14 @@ components:
         - type: object
           properties:
             type: { const: create_campaign_bundle }
-            payload: { $ref: "#/components/schemas/CampaignBundleProposal" }
+            review: { $ref: "#/components/schemas/CampaignBundleProposal" }
             result:
               oneOf:
                 [
                   { $ref: "#/components/schemas/CreateCampaignResult" },
-                  { $ref: "#/components/schemas/MutationFailed" },
+                   { $ref: "#/components/schemas/MutationFailed" },
+                   { $ref: "#/components/schemas/ExecutionProgress" },
+                   { $ref: "#/components/schemas/StaleExecutionProgress" },
                   { type: "null" },
                 ]
     UpdateObjectOperation:
@@ -1922,12 +1958,14 @@ components:
         - type: object
           properties:
             type: { const: update_object }
-            payload: { $ref: "#/components/schemas/UpdateObjectPayload" }
+            review: { $ref: "#/components/schemas/UpdateObjectPayload" }
             result:
               oneOf:
                 [
                   { $ref: "#/components/schemas/MutationResult" },
-                  { type: "null" },
+                   { $ref: "#/components/schemas/ExecutionProgress" },
+                   { $ref: "#/components/schemas/StaleExecutionProgress" },
+                   { type: "null" },
                 ]
     ChangeDeliveryOperation:
       allOf:
@@ -1935,12 +1973,14 @@ components:
         - type: object
           properties:
             type: { const: change_delivery }
-            payload: { $ref: "#/components/schemas/ChangeDeliveryPayload" }
+            review: { $ref: "#/components/schemas/ChangeDeliveryPayload" }
             result:
               oneOf:
                 [
                   { $ref: "#/components/schemas/MutationResult" },
-                  { type: "null" },
+                   { $ref: "#/components/schemas/ExecutionProgress" },
+                   { $ref: "#/components/schemas/StaleExecutionProgress" },
+                   { type: "null" },
                 ]
     ConfigureMonthlyBudgetOperation:
       allOf:
@@ -1948,12 +1988,14 @@ components:
         - type: object
           properties:
             type: { const: configure_monthly_budget }
-            payload: { $ref: "#/components/schemas/MonthlyBudgetPayload" }
+            review: { $ref: "#/components/schemas/MonthlyBudgetPayload" }
             result:
               oneOf:
                 [
                   { $ref: "#/components/schemas/MutationResult" },
-                  { type: "null" },
+                   { $ref: "#/components/schemas/ExecutionProgress" },
+                   { $ref: "#/components/schemas/StaleExecutionProgress" },
+                   { type: "null" },
                 ]
     Operation:
       oneOf:
@@ -1985,23 +2027,22 @@ components:
           { $ref: "#/components/schemas/TypedOperation" },
           {
             type: object,
-            required: [status, result],
+            required: [status, result, next_action],
             properties:
-              { status: { const: pending }, result: { type: "null" } },
+              { status: { const: pending }, result: { type: "null" }, next_action: { const: approve_or_reject } },
           },
         ]
     ExecutingOperation:
       unevaluatedProperties: false
       allOf:
-        [
-          { $ref: "#/components/schemas/TypedOperation" },
-          {
-            type: object,
-            required: [status, result],
-            properties:
-              { status: { const: executing }, result: { type: "null" } },
-          },
-        ]
+        - { $ref: "#/components/schemas/TypedOperation" }
+        - type: object
+          required: [status, result, execution_state, next_action]
+          properties:
+            status: { const: executing }
+            execution_state: { type: string, enum: [active, reconciliation_required] }
+            result: { $ref: "#/components/schemas/ExecutionProgress" }
+            next_action: { type: string, enum: [wait, reconcile_manually_no_automatic_replay] }
     SucceededOperation:
       unevaluatedProperties: false
       allOf:
@@ -2009,10 +2050,11 @@ components:
           { $ref: "#/components/schemas/TypedOperation" },
           {
             type: object,
-            required: [status, result],
+            required: [status, result, next_action],
             properties:
               {
                 status: { const: succeeded },
+                next_action: { const: no_action },
                 result:
                   {
                     type: object,
@@ -2029,9 +2071,9 @@ components:
           { $ref: "#/components/schemas/TypedOperation" },
           {
             type: object,
-            required: [status, result],
+            required: [status, result, next_action],
             properties:
-              { status: { const: rejected }, result: { type: "null" } },
+              { status: { const: rejected }, result: { type: "null" }, next_action: { const: no_action } },
           },
         ]
     ExpiredOperation:
@@ -2041,22 +2083,22 @@ components:
           { $ref: "#/components/schemas/TypedOperation" },
           {
             type: object,
-            required: [status, result],
+            required: [status, result, next_action],
             properties:
-              { status: { const: expired }, result: { type: "null" } },
+              { status: { const: expired }, result: { type: "null" }, next_action: { const: retry_new_operation } },
           },
         ]
     StaleOperation:
       unevaluatedProperties: false
       allOf:
-        [
-          { $ref: "#/components/schemas/TypedOperation" },
-          {
-            type: object,
-            required: [status, result],
-            properties: { status: { const: stale }, result: { type: "null" } },
-          },
-        ]
+        - { $ref: "#/components/schemas/TypedOperation" }
+        - type: object
+          required: [status, result, next_action]
+          properties:
+            status: { const: stale }
+            result:
+              oneOf: [{ type: "null" }, { $ref: "#/components/schemas/StaleExecutionProgress" }]
+            next_action: { const: retry_new_operation }
     FailedOperation:
       unevaluatedProperties: false
       allOf:
@@ -2064,11 +2106,12 @@ components:
           { $ref: "#/components/schemas/TypedOperation" },
           {
             type: object,
-            required: [status, result],
+            required: [status, result, next_action],
             properties:
               {
                 status: { const: failed },
                 result: { $ref: "#/components/schemas/MutationFailed" },
+                next_action: { const: fix_input },
               },
           },
         ]
@@ -2097,7 +2140,7 @@ components:
     CreateCampaignResult:
       type: object
       additionalProperties: false
-      required: [status, completed_at, campaign, ad_set, creative, ad]
+      required: [status, completed_at, campaign, ad_set, creative, ad, next_action]
       properties:
         status: { const: succeeded }
         completed_at: { type: string, format: date-time }
@@ -2105,6 +2148,7 @@ components:
         ad_set: { $ref: "#/components/schemas/PausedCreatedObject" }
         creative: { $ref: "#/components/schemas/BoundCreative" }
         ad: { $ref: "#/components/schemas/PausedCreatedObject" }
+        next_action: { const: no_action }
       description: Exactly one Campaign, Ad Set, Creative, and Ad; only the three delivery objects are PAUSED.
     MutationResult:
       {
@@ -2118,14 +2162,15 @@ components:
     MutationSucceeded:
       type: object
       additionalProperties: false
-      required: [status, completed_at]
+      required: [status, completed_at, next_action]
       properties:
         status: { const: succeeded }
         completed_at: { type: string, format: date-time }
+        next_action: { const: no_action }
     MutationFailed:
       type: object
       additionalProperties: false
-      required: [status, completed_at, failure_code]
+      required: [status, completed_at, failure_code, proven_resources, failed_or_ambiguous_step, next_action]
       properties:
         status: { const: failed }
         completed_at: { type: string, format: date-time }
@@ -2144,6 +2189,51 @@ components:
                 meta_error,
               ],
           }
+        proven_resources:
+          type: array
+          items: { $ref: "#/components/schemas/ProvenResource" }
+        failed_or_ambiguous_step:
+          oneOf: [{ type: string, minLength: 1, maxLength: 255 }, { type: "null" }]
+        next_action: { const: fix_input }
+    ProvenResource:
+      type: object
+      additionalProperties: false
+      required: [type, id]
+      properties:
+        type: { type: string, enum: [image, video, campaign, ad_set, creative, ad, object, budget] }
+        id: { $ref: "#/components/schemas/Identifier" }
+    ExecutionProgress:
+      oneOf:
+        - { $ref: "#/components/schemas/ActiveExecutionProgress" }
+        - { $ref: "#/components/schemas/ReconciliationRequiredProgress" }
+    ActiveExecutionProgress:
+      type: object
+      additionalProperties: false
+      required: [status, proven_resources, failed_or_ambiguous_step, next_action]
+      properties:
+        status: { const: executing }
+        proven_resources: { type: array, items: { $ref: "#/components/schemas/ProvenResource" } }
+        failed_or_ambiguous_step: { type: "null" }
+        next_action: { const: wait }
+    ReconciliationRequiredProgress:
+      type: object
+      additionalProperties: false
+      required: [status, proven_resources, failed_or_ambiguous_step, next_action]
+      properties:
+        status: { const: reconciliation_required }
+        proven_resources: { type: array, items: { $ref: "#/components/schemas/ProvenResource" } }
+        failed_or_ambiguous_step: { type: string, minLength: 1, maxLength: 255 }
+        next_action: { const: reconcile_manually_no_automatic_replay }
+    StaleExecutionProgress:
+      type: object
+      additionalProperties: false
+      required: [status, proven_resources, failed_or_ambiguous_step, next_action]
+      properties:
+        status: { const: stale }
+        proven_resources: { type: array, items: { $ref: "#/components/schemas/ProvenResource" } }
+        failed_or_ambiguous_step:
+          oneOf: [{ type: string, minLength: 1, maxLength: 255 }, { type: "null" }]
+        next_action: { const: retry_new_operation }
     OperationResponse:
       type: object
       additionalProperties: false
@@ -2252,6 +2342,7 @@ components:
         errors:
           type: array
           items: { $ref: "#/components/schemas/FieldError" }
+        next_action: { $ref: "#/components/schemas/NextAction" }
     CapabilityProblemBase:
       type: object
       required: [type, title, status, code, detail, request_id]
@@ -2379,32 +2470,24 @@ components:
       unevaluatedProperties: false
       allOf:
         - $ref: "#/components/schemas/ProblemBase"
-        - {
-            type: object,
-            properties:
-              {
-                status: { const: 409 },
-                code:
-                  {
-                    type: string,
-                    enum:
-                      [
-                        client_account_mismatch,
-                        operation_stale,
-                        operation_already_resolved,
-                      ],
-                  },
-              },
-          }
+        - type: object
+          required: [next_action]
+          properties:
+            status: { const: 409 }
+            code:
+              type: string
+              enum: [client_account_mismatch, operation_stale, operation_already_resolved]
+            next_action: { type: string, enum: [retry_new_operation, no_action] }
     Problem410:
       unevaluatedProperties: false
       allOf:
         - $ref: "#/components/schemas/ProblemBase"
-        - {
-            type: object,
-            properties:
-              { status: { const: 410 }, code: { const: operation_expired } },
-          }
+        - type: object
+          required: [next_action]
+          properties:
+            status: { const: 410 }
+            code: { const: operation_expired }
+            next_action: { const: retry_new_operation }
     Problem413:
       unevaluatedProperties: false
       allOf:

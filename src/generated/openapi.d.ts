@@ -234,6 +234,10 @@ export interface paths {
         /**
          * Approve and execute an operation
          * @description OWNER-COMMAND ONLY through deterministic `/approve-ad`, outside model dispatch.
+         *     The request has no body: Transfer-Encoding, non-canonical/nonzero Content-Length,
+         *     or any parsed body is rejected before decision processing.
+         *     Durable global and owner rate limits reject excess attempts before proof processing
+         *     with 429 and Retry-After.
          *     Approval is accepted only while now < expires_at; equality is expired. Before
          *     at-most-once execution, scope, budget, Meta authority, integration generation,
          *     and bound media hashes are revalidated. Decision and execution are audited.
@@ -257,6 +261,10 @@ export interface paths {
         /**
          * Reject an operation
          * @description OWNER-COMMAND ONLY through deterministic `/reject-ad`, outside model dispatch.
+         *     The request has no body: Transfer-Encoding, non-canonical/nonzero Content-Length,
+         *     or any parsed body is rejected before decision processing.
+         *     Durable global and owner rate limits reject excess attempts before proof processing
+         *     with 429 and Retry-After.
          *     Rejection is separate from approval, valid only while now < expires_at,
          *     idempotent, immutable, audited, and permanently prevents execution.
          */
@@ -689,7 +697,7 @@ export interface components {
             ad_set: components["schemas"]["AdSetProposal"];
             creative: components["schemas"]["CreativeProposal"];
             ad: components["schemas"]["AdProposal"];
-        };
+        } & unknown;
         CampaignProposal: {
             name: string;
             budget: components["schemas"]["DailyBudget"] | components["schemas"]["LifetimeBudget"];
@@ -810,7 +818,8 @@ export interface components {
             scope: components["schemas"]["ResolvedScope"];
             integration_generation: components["schemas"]["Identifier"];
             payload_hash: string;
-            payload: unknown;
+            review: components["schemas"]["OperationReview"];
+            next_action: components["schemas"]["NextAction"];
             /** Format: date-time */
             created_at: string;
             /**
@@ -821,12 +830,15 @@ export interface components {
             decision?: components["schemas"]["OperationDecision"] | null;
             result?: null | Record<string, never>;
         };
+        OperationReview: components["schemas"]["CampaignBundleProposal"] | components["schemas"]["UpdateObjectPayload"] | components["schemas"]["ChangeDeliveryPayload"] | components["schemas"]["MonthlyBudgetPayload"];
+        /** @enum {string} */
+        NextAction: "approve_or_reject" | "wait" | "reconcile_manually_no_automatic_replay" | "retry_new_operation" | "fix_input" | "no_action";
         TypedOperation: components["schemas"]["CreateCampaignOperation"] | components["schemas"]["UpdateObjectOperation"] | components["schemas"]["ChangeDeliveryOperation"] | components["schemas"]["ConfigureMonthlyBudgetOperation"];
         CreateCampaignOperation: components["schemas"]["OperationBase"] & {
             /** @constant */
             type?: "create_campaign_bundle";
-            payload?: components["schemas"]["CampaignBundleProposal"];
-            result?: components["schemas"]["CreateCampaignResult"] | components["schemas"]["MutationFailed"] | null;
+            review?: components["schemas"]["CampaignBundleProposal"];
+            result?: components["schemas"]["CreateCampaignResult"] | components["schemas"]["MutationFailed"] | components["schemas"]["ExecutionProgress"] | components["schemas"]["StaleExecutionProgress"] | null;
         } & {
             /**
              * @description discriminator enum property added by openapi-typescript
@@ -837,8 +849,8 @@ export interface components {
         UpdateObjectOperation: components["schemas"]["OperationBase"] & {
             /** @constant */
             type?: "update_object";
-            payload?: components["schemas"]["UpdateObjectPayload"];
-            result?: components["schemas"]["MutationResult"] | null;
+            review?: components["schemas"]["UpdateObjectPayload"];
+            result?: components["schemas"]["MutationResult"] | components["schemas"]["ExecutionProgress"] | components["schemas"]["StaleExecutionProgress"] | null;
         } & {
             /**
              * @description discriminator enum property added by openapi-typescript
@@ -849,8 +861,8 @@ export interface components {
         ChangeDeliveryOperation: components["schemas"]["OperationBase"] & {
             /** @constant */
             type?: "change_delivery";
-            payload?: components["schemas"]["ChangeDeliveryPayload"];
-            result?: components["schemas"]["MutationResult"] | null;
+            review?: components["schemas"]["ChangeDeliveryPayload"];
+            result?: components["schemas"]["MutationResult"] | components["schemas"]["ExecutionProgress"] | components["schemas"]["StaleExecutionProgress"] | null;
         } & {
             /**
              * @description discriminator enum property added by openapi-typescript
@@ -861,8 +873,8 @@ export interface components {
         ConfigureMonthlyBudgetOperation: components["schemas"]["OperationBase"] & {
             /** @constant */
             type?: "configure_monthly_budget";
-            payload?: components["schemas"]["MonthlyBudgetPayload"];
-            result?: components["schemas"]["MutationResult"] | null;
+            review?: components["schemas"]["MonthlyBudgetPayload"];
+            result?: components["schemas"]["MutationResult"] | components["schemas"]["ExecutionProgress"] | components["schemas"]["StaleExecutionProgress"] | null;
         } & {
             /**
              * @description discriminator enum property added by openapi-typescript
@@ -875,6 +887,8 @@ export interface components {
             /** @constant */
             status: "pending";
             result: null;
+            /** @constant */
+            next_action: "approve_or_reject";
         } & {
             /**
              * @description discriminator enum property added by openapi-typescript
@@ -885,7 +899,11 @@ export interface components {
         ExecutingOperation: Omit<components["schemas"]["TypedOperation"], "type"> & {
             /** @constant */
             status: "executing";
-            result: null;
+            /** @enum {string} */
+            execution_state: "active" | "reconciliation_required";
+            result: components["schemas"]["ExecutionProgress"];
+            /** @enum {string} */
+            next_action: "wait" | "reconcile_manually_no_automatic_replay";
         } & {
             /**
              * @description discriminator enum property added by openapi-typescript
@@ -896,6 +914,8 @@ export interface components {
         SucceededOperation: Omit<components["schemas"]["TypedOperation"], "type"> & {
             /** @constant */
             status: "succeeded";
+            /** @constant */
+            next_action: "no_action";
             result: {
                 /** @constant */
                 status: "succeeded";
@@ -911,6 +931,8 @@ export interface components {
             /** @constant */
             status: "rejected";
             result: null;
+            /** @constant */
+            next_action: "no_action";
         } & {
             /**
              * @description discriminator enum property added by openapi-typescript
@@ -922,6 +944,8 @@ export interface components {
             /** @constant */
             status: "expired";
             result: null;
+            /** @constant */
+            next_action: "retry_new_operation";
         } & {
             /**
              * @description discriminator enum property added by openapi-typescript
@@ -932,7 +956,9 @@ export interface components {
         StaleOperation: Omit<components["schemas"]["TypedOperation"], "type"> & {
             /** @constant */
             status: "stale";
-            result: null;
+            result: null | components["schemas"]["StaleExecutionProgress"];
+            /** @constant */
+            next_action: "retry_new_operation";
         } & {
             /**
              * @description discriminator enum property added by openapi-typescript
@@ -944,6 +970,8 @@ export interface components {
             /** @constant */
             status: "failed";
             result: components["schemas"]["MutationFailed"];
+            /** @constant */
+            next_action: "fix_input";
         } & {
             /**
              * @description discriminator enum property added by openapi-typescript
@@ -978,6 +1006,8 @@ export interface components {
             ad_set: components["schemas"]["PausedCreatedObject"];
             creative: components["schemas"]["BoundCreative"];
             ad: components["schemas"]["PausedCreatedObject"];
+            /** @constant */
+            next_action: "no_action";
         };
         MutationResult: components["schemas"]["MutationSucceeded"] | components["schemas"]["MutationFailed"];
         MutationSucceeded: {
@@ -988,6 +1018,8 @@ export interface components {
             status: "MutationSucceeded";
             /** Format: date-time */
             completed_at: string;
+            /** @constant */
+            next_action: "no_action";
         };
         MutationFailed: {
             /**
@@ -999,6 +1031,40 @@ export interface components {
             completed_at: string;
             /** @enum {string} */
             failure_code: "operation_stale" | "meta_configuration_required" | "meta_reauthorization_required" | "meta_asset_access_required" | "meta_permission_missing" | "media_invalid" | "rate_limited" | "meta_error";
+            proven_resources: components["schemas"]["ProvenResource"][];
+            failed_or_ambiguous_step: string | null;
+            /** @constant */
+            next_action: "fix_input";
+        };
+        ProvenResource: {
+            /** @enum {string} */
+            type: "image" | "video" | "campaign" | "ad_set" | "creative" | "ad" | "object" | "budget";
+            id: components["schemas"]["Identifier"];
+        };
+        ExecutionProgress: components["schemas"]["ActiveExecutionProgress"] | components["schemas"]["ReconciliationRequiredProgress"];
+        ActiveExecutionProgress: {
+            /** @constant */
+            status: "executing";
+            proven_resources: components["schemas"]["ProvenResource"][];
+            failed_or_ambiguous_step: null;
+            /** @constant */
+            next_action: "wait";
+        };
+        ReconciliationRequiredProgress: {
+            /** @constant */
+            status: "reconciliation_required";
+            proven_resources: components["schemas"]["ProvenResource"][];
+            failed_or_ambiguous_step: string;
+            /** @constant */
+            next_action: "reconcile_manually_no_automatic_replay";
+        };
+        StaleExecutionProgress: {
+            /** @constant */
+            status: "stale";
+            proven_resources: components["schemas"]["ProvenResource"][];
+            failed_or_ambiguous_step: string | null;
+            /** @constant */
+            next_action: "retry_new_operation";
         };
         OperationResponse: {
             request_id: components["schemas"]["RequestId"];
@@ -1062,6 +1128,7 @@ export interface components {
             resolved_scope?: components["schemas"]["ResolvedScope"];
             operation_id?: components["schemas"]["Identifier"];
             errors?: components["schemas"]["FieldError"][];
+            next_action?: components["schemas"]["NextAction"];
         };
         /** @description Capability error shape deliberately excludes resolved_scope and resolved labels. */
         CapabilityProblemBase: {
@@ -1143,12 +1210,16 @@ export interface components {
             status?: 409;
             /** @enum {string} */
             code?: "client_account_mismatch" | "operation_stale" | "operation_already_resolved";
+            /** @enum {string} */
+            next_action: "retry_new_operation" | "no_action";
         };
         Problem410: components["schemas"]["ProblemBase"] & {
             /** @constant */
             status?: 410;
             /** @constant */
             code?: "operation_expired";
+            /** @constant */
+            next_action: "retry_new_operation";
         };
         Problem413: components["schemas"]["ProblemBase"] & {
             /** @constant */
@@ -1885,6 +1956,7 @@ export interface operations {
             404: components["responses"]["NotFound"];
             409: components["responses"]["OperationLifecycleConflict"];
             410: components["responses"]["Gone"];
+            429: components["responses"]["RateLimited"];
             500: components["responses"]["InternalError"];
         };
     };
