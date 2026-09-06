@@ -38,6 +38,7 @@ export function renderLaunchAgent(input: {
   <array><string>${xml(input.nodePath)}</string><string>${xml(server)}</string></array>
   <key>WorkingDirectory</key><string>${xml(input.projectRoot)}</string>
   <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>ThrottleInterval</key><integer>30</integer>
   <key>Umask</key><integer>63</integer>
   <key>ProcessType</key><string>Background</string>

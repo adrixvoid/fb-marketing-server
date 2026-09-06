@@ -1,6 +1,7 @@
 import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
-import { lstat, readFile, realpath, stat } from "node:fs/promises";
-import { basename, relative, sep } from "node:path";
+import { constants } from "node:fs";
+import { lstat, open, realpath, stat } from "node:fs/promises";
+import { basename, relative, resolve, sep } from "node:path";
 import { spawn } from "node:child_process";
 import { Type, type TSchema } from "@sinclair/typebox";
 
@@ -11,7 +12,6 @@ export const TOOL_NAMES = [
   "list_campaigns",
   "query_insights",
   "budget_summary",
-  "upload_chat_media",
   "propose_operation",
   "get_operation",
 ] as const;
@@ -19,6 +19,8 @@ export const TOOL_NAMES = [
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+const STAGE_EVENT_TTL_MS = 5 * 60_000;
+const MAX_STAGE_EVENTS = 1_024;
 
 export interface PluginConfig {
   baseUrl: string;
@@ -41,13 +43,6 @@ export interface Gateway {
   secret(account: string): Promise<string>;
 }
 
-interface ToolContext {
-  messageChannel?: string;
-  requesterSenderId?: string;
-  agentAccountId?: string;
-  deliveryContext?: { channel?: string; to?: string; accountId?: string; threadId?: string | number };
-}
-
 interface ToolDefinition {
   name: string;
   description: string;
@@ -65,6 +60,7 @@ interface CommandContext {
   senderId?: string;
   channel: string;
   isAuthorizedSender: boolean;
+  senderIsOwner?: boolean;
   args?: string;
   config: { commands?: { ownerAllowFrom?: string[] } };
 }
@@ -226,86 +222,180 @@ function inside(path: string, root: string) {
   return child === "" || (!child.startsWith(`..${sep}`) && child !== ".." && !child.startsWith(sep));
 }
 
-export async function readTrustedAttachment(input: { path: string; contentType?: string; roots: string[] }) {
+interface TrustedRoot {
+  lexical: string;
+  actual: string;
+  dev: bigint | number;
+  ino: bigint | number;
+}
+
+async function trustedRoot(root: string): Promise<TrustedRoot> {
+  const lexical = resolve(root);
+  const rootInfo = await lstat(lexical, { bigint: true });
+  if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) throw new Error();
+  const actual = await realpath(lexical);
+  const actualInfo = await stat(actual, { bigint: true });
+  if (rootInfo.dev !== actualInfo.dev || rootInfo.ino !== actualInfo.ino) throw new Error();
+  return { lexical, actual, dev: rootInfo.dev, ino: rootInfo.ino };
+}
+
+async function rootIsUnchanged(root: TrustedRoot) {
+  const current = await trustedRoot(root.lexical);
+  return current.actual === root.actual && current.dev === root.dev && current.ino === root.ino;
+}
+
+export async function readTrustedAttachment(input: { path: string; contentType?: string; roots: string[]; afterOpen?: () => Promise<void> }) {
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
   try {
     const pathInfo = await lstat(input.path);
     if (!pathInfo.isFile() || pathInfo.isSymbolicLink()) throw new Error();
     const actualPath = await realpath(input.path);
-    const allowedRoots = await Promise.all(input.roots.map((root) => realpath(root)));
-    if (!allowedRoots.some((root) => inside(actualPath, root))) throw new Error();
-    const fileInfo = await stat(actualPath);
+    const inputPath = resolve(input.path);
+    const allowedRoots = await Promise.all(input.roots.map(trustedRoot));
+    const allowedRoot = allowedRoots.find((root) => inside(inputPath, root.lexical) && inside(actualPath, root.actual) && relative(root.lexical, inputPath) === relative(root.actual, actualPath));
+    if (!allowedRoot) throw new Error();
+    handle = await open(actualPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const fileInfo = await handle.stat();
     if (!fileInfo.isFile() || fileInfo.size < 1 || fileInfo.size > MAX_ATTACHMENT_BYTES) throw new Error();
-    const bytes = await readFile(actualPath);
+    await input.afterOpen?.();
+    const bytes = await handle.readFile();
+    const after = await handle.stat();
+    if (
+      after.dev !== fileInfo.dev || after.ino !== fileInfo.ino || after.size !== fileInfo.size ||
+      await realpath(input.path) !== actualPath || !await rootIsUnchanged(allowedRoot)
+    ) throw new Error();
     return { bytes, filename: basename(actualPath), contentType: input.contentType ?? "application/octet-stream" };
   } catch {
     throw new Error("Trusted attachment is unavailable");
+  } finally {
+    await handle?.close().catch(() => undefined);
   }
 }
 
-type AttachmentFact = {
-  path: string;
-  contentType?: string;
-  source: "openclaw_chat_attachment";
-  attachmentId: string;
-  expiresAt: number;
-};
-
 function trustedIdentity(value: string | undefined): value is string {
-  return typeof value === "string" && value.length > 0 && value.length <= 4_096 && !/[\0\r\n]/.test(value);
+  return typeof value === "string" && value.length > 0 && value.length <= 4_096 && !/[\u0000-\u001f\u007f-\u009f]/.test(value);
 }
 
-function opaqueAttachmentId(key: string, channel: string, messageId: string, index: number) {
-  const identity = [key, channel, messageId, String(index)].map((value) => `${Buffer.byteLength(value)}:${value}`).join("|");
+function opaqueAttachmentId(values: string[]) {
+  const identity = values.map((value) => `${Buffer.byteLength(value)}:${value}`).join("|");
   return `oc_${createHash("sha256").update(identity).digest("hex")}`;
 }
 
-export class TrustedAttachmentStore {
-  readonly #entries = new Map<string, AttachmentFact[]>();
-  constructor(private readonly roots: string[], private readonly now = () => Date.now()) {}
-
-  capture(
-    key: string | undefined,
-    paths: string[],
-    contentTypes: string[] = [],
-    identity?: { channel?: string; messageId?: string },
-  ) {
-    const channel = identity?.channel;
-    const messageId = identity?.messageId;
-    if (!key || !trustedIdentity(channel) || !trustedIdentity(messageId)) return;
-    const facts = paths.map((path, index) => ({
-      path,
-      ...(contentTypes[index] ? { contentType: contentTypes[index] } : {}),
-      source: "openclaw_chat_attachment" as const,
-      attachmentId: opaqueAttachmentId(key, channel, messageId, index),
-      expiresAt: this.now() + 5 * 60_000,
-    }));
-    this.#entries.set(key, facts);
-  }
-
-  async take(key: string | undefined) {
-    const facts = key ? this.#entries.get(key) : undefined;
-    if (!key || !facts || facts.length !== 1 || facts[0]!.expiresAt < this.now()) throw new Error("Exactly one fresh trusted attachment is required");
-    this.#entries.delete(key);
-    const fact = facts[0]!;
-    return { ...(await readTrustedAttachment({ ...fact, roots: this.roots })), source: fact.source, attachmentId: fact.attachmentId };
-  }
+interface InboundMediaFact {
+  path?: string;
+  contentType?: string;
+  messageId?: string;
 }
 
-export function attachmentContextKey(input: { channel?: string | undefined; account?: string | undefined; conversation?: string | undefined; sender?: string | undefined }): string | undefined {
-  const values = [input.channel, input.account, input.conversation, input.sender];
-  if (values.some((value) => typeof value !== "string" || value.length === 0 || /[\0\r\n]/.test(value))) return undefined;
-  return values.map((value) => `${Buffer.byteLength(value!)}:${value}`).join("|");
+interface InboundClaimEvent {
+  content: string;
+  timestamp?: number;
+  channel: string;
+  senderId?: string;
+  messageId?: string;
+  commandAuthorized?: boolean;
+  senderIsOwner?: boolean;
+  mediaStagingPending?: boolean;
+  media?: InboundMediaFact[];
 }
 
-function contextKey(context: ToolContext | undefined) {
-  if (!context) return undefined;
-  return attachmentContextKey({
-    channel: context.messageChannel ?? context.deliveryContext?.channel,
-    account: context.agentAccountId ?? context.deliveryContext?.accountId,
-    conversation: context.deliveryContext?.to,
-    sender: context.requesterSenderId,
-  });
+interface InboundClaimContext {
+  channelId: string;
+  accountId?: string;
+  conversationId?: string;
+  senderId?: string;
+  messageId?: string;
 }
+
+const STAGE_COMMAND = "/stage-ad-media";
+const SUPPORTED_ATTACHMENT_TYPES = new Set(["image/jpeg", "image/png", "video/mp4"]);
+
+type StageMediaResult = { handled: boolean; reply?: { text: string } };
+interface StageEventEntry {
+  expiresAt: number;
+  settled: boolean;
+  result: Promise<StageMediaResult>;
+}
+
+export function createStageMediaCommandHandler() {
+  const events = new Map<string, StageEventEntry>();
+
+  return async function handleStageMediaCommand(input: {
+    event: InboundClaimEvent;
+    context: InboundClaimContext;
+    config: PluginConfig;
+    ownerAllowFrom?: string[];
+    gateway: Gateway;
+    now?: () => number;
+  }): Promise<StageMediaResult> {
+    if (input.event.content !== STAGE_COMMAND && !input.event.content.startsWith(`${STAGE_COMMAND} `)) return { handled: false };
+    const match = /^\/stage-ad-media ([A-Za-z0-9][A-Za-z0-9._:-]{0,254}) ([A-Za-z0-9][A-Za-z0-9._:-]{0,254})$/.exec(input.event.content);
+    if (!match) return { handled: true, reply: { text: "Usage: /stage-ad-media <client_id> <ad_account_id>" } };
+
+    const { event, context } = input;
+    const owner = trustedIdentity(context.senderId) ? `${context.channelId}:${context.senderId}` : "";
+    if (
+      event.commandAuthorized !== true || event.senderIsOwner !== true || input.ownerAllowFrom?.length !== 1 || input.ownerAllowFrom[0] !== owner ||
+      event.channel !== context.channelId || event.senderId !== context.senderId || event.messageId !== context.messageId
+    ) return { handled: true, reply: { text: "Command sender is not authorized." } };
+
+    if (!trustedIdentity(event.messageId)) return { handled: true, reply: { text: "Media staging failed: exactly one fresh supported attachment is required." } };
+    const now = (input.now ?? Date.now)();
+    const eventKey = opaqueAttachmentId([context.channelId, context.accountId ?? "", context.conversationId ?? "", context.senderId!, event.messageId, match[1]!, match[2]!]);
+    const existing = events.get(eventKey);
+    if (existing && (!existing.settled || existing.expiresAt >= now)) return existing.result;
+    if (existing) events.delete(eventKey);
+    for (const [key, eventEntry] of events) if (eventEntry.settled && eventEntry.expiresAt < now) events.delete(key);
+    if (events.size >= MAX_STAGE_EVENTS) return { handled: true, reply: { text: "Media staging failed." } };
+
+    const entry = { expiresAt: now + STAGE_EVENT_TTL_MS, settled: false } as StageEventEntry;
+    entry.result = (async () => {
+      const media = event.media;
+      if (
+        event.mediaStagingPending === true || !Number.isFinite(event.timestamp) || event.timestamp! > now ||
+        now - event.timestamp! > STAGE_EVENT_TTL_MS || media?.length !== 1 || !trustedIdentity(media[0]!.path) ||
+        !SUPPORTED_ATTACHMENT_TYPES.has(media[0]!.contentType ?? "") || media[0]!.messageId !== undefined && media[0]!.messageId !== event.messageId
+      ) return { handled: true, reply: { text: "Media staging failed: exactly one fresh supported attachment is required." } };
+
+      let attachment: Awaited<ReturnType<typeof readTrustedAttachment>> | undefined;
+      try {
+        attachment = await readTrustedAttachment({ path: media[0]!.path!, contentType: media[0]!.contentType!, roots: input.config.attachmentRoots });
+        const form = new FormData();
+        form.set("client_id", match[1]!);
+        form.set("ad_account_id", match[2]!);
+        form.set("attachment", JSON.stringify({
+          source: "openclaw_chat_attachment",
+          attachment_id: opaqueAttachmentId([context.channelId, context.accountId ?? "", context.conversationId ?? "", context.senderId!, context.messageId!, "0"]),
+          original_filename: attachment.filename,
+          declared_content_type: attachment.contentType,
+        }));
+        form.set("file", new Blob([attachment.bytes], { type: attachment.contentType }), attachment.filename);
+        const result = await input.gateway.request("POST", "/v1/media", { form });
+        const mediaResult = result.media as Record<string, unknown> | undefined;
+        const scope = result.scope as Record<string, unknown> | undefined;
+        const expiresAt = typeof mediaResult?.expires_at === "string" ? mediaResult.expires_at : "";
+        if (
+          !mediaResult || !scope || scope.client_id !== match[1] || scope.ad_account_id !== match[2] ||
+          !trustedIdentity(mediaResult.media_id as string | undefined) || !/^[a-f0-9]{64}$/.test(String(mediaResult.sha256 ?? "")) ||
+          !SUPPORTED_ATTACHMENT_TYPES.has(String(mediaResult.content_type ?? "")) || !Number.isSafeInteger(mediaResult.size_bytes) ||
+          Number(mediaResult.size_bytes) < 1 || Number(mediaResult.size_bytes) > MAX_ATTACHMENT_BYTES ||
+          !trustedIdentity(expiresAt) || new Date(expiresAt).toISOString() !== expiresAt || !trustedIdentity(result.request_id as string | undefined)
+        ) throw new Error("Gateway returned an invalid response");
+        return { handled: true, reply: { text: `Staged ${mediaResult.media_id} (${mediaResult.content_type}, ${mediaResult.size_bytes} bytes, SHA-256 ${mediaResult.sha256}) for ${match[1]}/${match[2]}; expires ${expiresAt}. Request ${result.request_id}.` } };
+      } catch (error) {
+        const suffix = error instanceof GatewayProblem ? ` HTTP ${error.status}. Request ${error.requestId}.` : "";
+        return { handled: true, reply: { text: `Media staging failed.${suffix}` } };
+      } finally {
+        attachment?.bytes.fill(0);
+      }
+    })();
+    events.set(eventKey, entry);
+    void entry.result.finally(() => { entry.settled = true; });
+    return entry.result;
+  };
+}
+
+export const handleStageMediaCommand = createStageMediaCommandHandler();
 
 function proof(secret: string, input: { method: string; path: string; decision: "approved" | "rejected"; operationId: string; owner: string }) {
   const issuedAt = Math.floor(Date.now() / 1000).toString();
@@ -341,8 +431,6 @@ async function findOperationScope(gateway: Gateway, operationId: string) {
 export function createOpenClawRegistration(input: {
   config: PluginConfig;
   gateway: Gateway;
-  attachments?: TrustedAttachmentStore;
-  toolContext?: ToolContext;
 }) {
   const { gateway } = input;
   const page = { cursor: Type.Optional(Type.String()), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })) };
@@ -402,23 +490,6 @@ export function createOpenClawRegistration(input: {
       scoped({ as_of: Type.Optional(Type.String({ format: "date-time" })) as never }),
       Type.Object({ global: Type.Literal(true), as_of: Type.Optional(Type.String({ format: "date-time" })), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })) }, { additionalProperties: false }),
     ]), execute: async (_id, p) => modelResult(p, () => p.global === true ? globalBudget(p) : gateway.request("GET", "/v1/budget-pacing", { query: queryOf(p, ["client_id", "ad_account_id", "as_of"]) })) },
-    { name: "upload_chat_media", description: "Stage exactly one fresh host-trusted inbound attachment.", parameters: scoped(), execute: async (_id, p) => {
-      if (!input.attachments) throw new Error("Trusted attachment context is unavailable");
-      const attachment = await input.attachments.take(contextKey(input.toolContext));
-      try {
-        const form = new FormData();
-        form.set("client_id", asString(p.client_id, "client_id"));
-        form.set("ad_account_id", asString(p.ad_account_id, "ad_account_id"));
-        form.set("attachment", JSON.stringify({
-          source: attachment.source,
-          attachment_id: attachment.attachmentId,
-          original_filename: attachment.filename,
-          declared_content_type: attachment.contentType,
-        }));
-        form.set("file", new Blob([attachment.bytes], { type: attachment.contentType }), attachment.filename);
-        return await modelResult(p, () => gateway.request("POST", "/v1/media", { form }));
-      } finally { attachment.bytes.fill(0); }
-    } },
     { name: "propose_operation", description: "Create an immutable pending operation; never approves or executes it.", parameters: scoped({ idempotency_key: Type.String({ minLength: 1 }) as never, type: Type.Union([Type.Literal("create_campaign_bundle"), Type.Literal("update_object"), Type.Literal("change_delivery"), Type.Literal("configure_monthly_budget")]) as never, payload: Type.Unknown() as never }), execute: async (_id, p) => modelResult(p, () => gateway.request("POST", "/v1/operations", { headers: { "idempotency-key": asString(p.idempotency_key, "idempotency_key") }, json: { client_id: asString(p.client_id, "client_id"), ad_account_id: asString(p.ad_account_id, "ad_account_id"), type: asString(p.type, "type"), payload: p.payload } })) },
     { name: "get_operation", description: "Get one operation in an explicit scope.", parameters: scoped({ operation_id: Type.String({ pattern: UUID.source }) as never }), execute: async (_id, p) => modelResult(p, () => gateway.request("GET", `/v1/operations/${asString(p.operation_id, "operation_id")}`, { query: queryOf(p, ["client_id", "ad_account_id"]) })) },
   ];
@@ -431,7 +502,7 @@ export function createOpenClawRegistration(input: {
     async handler(ctx) {
       const owner = ctx.senderId ? `${ctx.channel}:${ctx.senderId}` : "";
       const allow = ctx.config.commands?.ownerAllowFrom ?? [];
-      if (!ctx.isAuthorizedSender || allow.length !== 1 || allow[0] !== owner) return { text: "Command sender is not authorized." };
+      if (!ctx.isAuthorizedSender || ctx.senderIsOwner !== true || allow.length !== 1 || allow[0] !== owner) return { text: "Command sender is not authorized." };
       const operationId = optionalString(ctx.args)?.trim() ?? "";
       if (!UUID.test(operationId)) return { text: "Expected one canonical operation UUID." };
       try {
@@ -439,12 +510,18 @@ export function createOpenClawRegistration(input: {
         const query = new URLSearchParams(scope).toString();
         const path = `/v1/operations/${operationId}/${decision === "approved" ? "approve" : "reject"}?${query}`;
         const secret = await gateway.secret(input.config.ownerProofAccount);
-        try {
-          const result = await gateway.request("POST", path, { headers: { "x-openclaw-owner-command": proof(secret, { method: "POST", path, decision, operationId, owner }) } });
-          const status = typeof result.status === "string" ? result.status : decision;
-          const requestId = typeof result.request_id === "string" ? ` Request ${result.request_id}.` : "";
-          return { text: `Operation ${operationId}: ${status}.${requestId}` };
-        } finally { secret.replace(/./g, "0"); }
+        const result = await gateway.request("POST", path, { headers: { "x-openclaw-owner-command": proof(secret, { method: "POST", path, decision, operationId, owner }) } });
+        const operation = result.operation !== null && typeof result.operation === "object" ? result.operation as Record<string, unknown> : undefined;
+        const resultState = operation?.result !== null && typeof operation?.result === "object"
+          ? (operation.result as Record<string, unknown>).status
+          : undefined;
+        const status = typeof resultState === "string"
+          ? resultState
+          : typeof operation?.execution_state === "string"
+            ? `${String(operation.status)} (${operation.execution_state})`
+            : typeof operation?.status === "string" ? operation.status : "unknown";
+        const requestId = typeof result.request_id === "string" ? ` Request ${result.request_id}.` : "";
+        return { text: `Operation ${operationId}: ${status}.${requestId}` };
       } catch (error) {
         return { text: error instanceof Error ? error.message : "Owner command failed" };
       }

@@ -26,7 +26,7 @@ test("renders a private user LaunchAgent with absolute paths, no secrets, and cr
   assert.match(plist, /<string>\/opt\/node 24\/bin\/node<\/string>/);
   assert.match(plist, /fb &amp; ads/);
   assert.match(plist, /<key>RunAtLoad<\/key>\s*<true\/>/);
-  assert.doesNotMatch(plist, /KeepAlive|SuccessfulExit/);
+  assert.match(plist, /<key>KeepAlive<\/key>\s*<dict>\s*<key>SuccessfulExit<\/key>\s*<false\/>\s*<\/dict>/);
   assert.match(plist, /<key>ThrottleInterval<\/key>\s*<integer>30<\/integer>/);
   assert.match(plist, /<key>Umask<\/key>\s*<integer>63<\/integer>/);
   assert.match(plist, /Library\/Logs\/fb-marketing-server\/stdout\.log/);

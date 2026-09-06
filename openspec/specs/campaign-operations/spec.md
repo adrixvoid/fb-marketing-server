@@ -8,7 +8,7 @@ Define trusted chat media and immutable typed mutation proposals, including comp
 
 ### Requirement: Trusted chat attachment media
 
-Creative media MUST originate from host-trusted inbound OpenClaw attachment bytes and metadata, never a model path or URL. The service MUST validate multipart fields, byte limits, declared and actual content, and filename; hash and scope-bind accepted bytes; and remove staged content after completion or expiry. `original_filename` MUST be basename display metadata of 1–255 characters and MUST reject slash, backslash, and control characters.
+Creative media MUST originate from exactly one fresh host-trusted attachment on the same authorized owner event carrying `/stage-ad-media <client_id> <ad_account_id>`, never model execution, mutable latest-message state, a model path, or a URL. The plugin MUST reject missing, multiple, pending, expired, unsafe, out-of-root, and symlink inputs before calling the authenticated staging endpoint. The service MUST preserve explicit scope authorization, validate multipart fields, byte limits, declared and actual content, and filename; hash and scope-bind accepted bytes; and remove staged content after completion or expiry. `original_filename` MUST be basename display metadata of 1–255 characters and MUST reject slash, backslash, and control characters.
 
 #### Scenario: Valid attachment
 
@@ -40,7 +40,7 @@ Creation MUST accept only `SALES_WEBSITE`, `LEADS_WEBSITE`, and `LEADS_INSTANT_F
 
 ### Requirement: Immutable typed mutation proposals
 
-Complete create, object update, delivery change, and monthly-budget requests MUST create immutable scoped pending operations and MUST NOT execute from proposal creation. Dynamic assets and bound media MUST be validated at creation; validate-only Meta preflight SHOULD run where supported but MUST NOT replace approval. An idempotency key MUST bind caller, operation type, scope, and canonical payload hash permanently.
+Complete create, object update, delivery change, and monthly-budget requests MUST create immutable scoped pending operations and MUST NOT execute from proposal creation. Dynamic assets, bound media, local semantics, and mutation targets MUST be validated at creation. An idempotency key MUST bind caller, operation type, scope, and canonical payload hash permanently.
 
 #### Scenario: New proposal
 

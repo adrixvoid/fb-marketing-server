@@ -32,6 +32,7 @@ export interface MetaRequest {
   actor: string;
   correlationId: string;
   operation: string;
+  executionStep?: { executionId: string; stepKey: string };
 }
 
 export interface MetaPageRequest extends Omit<MetaRequest, "method" | "body" | "form"> {}
@@ -51,10 +52,22 @@ export class MetaError extends Error {
   }
 }
 
+const metaRateLimitCodes = new Set(["meta_4", "meta_17", "meta_32", "meta_613", "meta_80000", "meta_80001", "meta_80002", "meta_80003", "meta_80004", "meta_80005"]);
+
+export function isMetaRateLimit(error: MetaError): boolean {
+  return error.status === 429 || metaRateLimitCodes.has(error.code);
+}
+
+export function safeMetaRetryAfter(error: MetaError): number | undefined {
+  return Number.isSafeInteger(error.retryAfterSeconds) && error.retryAfterSeconds! >= 0 && error.retryAfterSeconds! <= 86_400
+    ? error.retryAfterSeconds
+    : undefined;
+}
+
 export interface MetaClientOptions {
   fetch: typeof globalThis.fetch;
   getCredentials: (scope: MetaScope) => Promise<MetaCredentials>;
-  audit: (event: AuditEvent) => Promise<unknown> | unknown;
+  audit: (event: AuditEvent, executionStep?: MetaRequest["executionStep"]) => Promise<unknown> | unknown;
   now?: () => Date;
   sleep?: (milliseconds: number) => Promise<void>;
   random?: () => number;
@@ -188,7 +201,7 @@ export function createMetaClient(options: MetaClientOptions) {
       occurredAt: now().toISOString(),
       outcome,
       evidence,
-    });
+    }, request.executionStep);
   }
 
   async function once<T>(request: MetaRequest): Promise<{ data: T; rate: MetaRateEvidence }> {

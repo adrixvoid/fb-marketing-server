@@ -7,6 +7,7 @@ import test, { type TestContext } from "node:test";
 import { buildApp } from "../src/app.js";
 import { openDatabase } from "../src/db.js";
 import { createMediaService } from "../src/media.js";
+import { MetaError } from "../src/meta-client.js";
 import { canonicalPayload, createOperationHandlers, createOperationsService, OperationError } from "../src/operations.js";
 import type { components } from "../src/generated/openapi.js";
 
@@ -38,7 +39,7 @@ function seed(db: ReturnType<typeof openDatabase>) {
   `);
 }
 
-async function fixture(t: TestContext, options: { validateTarget?: boolean; formPage?: string; formPublished?: boolean; formUsable?: boolean; omitFormState?: boolean } = {}) {
+async function fixture(t: TestContext, options: { validateTarget?: boolean; targetError?: Error; formPage?: string; formPublished?: boolean; formUsable?: boolean; omitFormState?: boolean } = {}) {
   const root = await mkdtemp(join(tmpdir(), "fb-marketing-server-operations-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const db = openDatabase(":memory:");
@@ -73,7 +74,10 @@ async function fixture(t: TestContext, options: { validateTarget?: boolean; form
         leads_instant_form: { status: "available" },
       },
     }),
-    validateTarget: async () => options.validateTarget ?? true,
+    validateTarget: async (input) => {
+      if (options.targetError !== undefined) throw options.targetError;
+      return options.validateTarget === false ? undefined : input.objectId;
+    },
     now: () => current,
   });
   return { db, mediaRoot, operations, staged, stage, setNow: (value: Date) => { current = value; } };
@@ -341,6 +345,29 @@ test("supports update, delivery, and local monthly-budget proposals but forbids 
     invalid.operations.propose({ actor: "openclaw:user-1", requestId: "request-target", idempotencyKey: "idempotency-target", request: proposals[0] }),
     (error: unknown) => error instanceof OperationError && error.code === "asset_incompatible",
   );
+});
+
+test("proposal target revalidation normalizes Meta rate limits and upstream failures", async (t) => {
+  const request = { type: "update_object", client_id: "client-1", ad_account_id: "act_1", payload: { object_type: "campaign", object_id: "campaign-1", changes: { name: "Renamed" } } } as const;
+  for (const [name, metaError, expectedStatus, expectedCode, retryAfter] of [
+    ["rate-limit", new MetaError("limited", "meta_4", 400, 23, true), 429, "rate_limited", "23"],
+    ["malformed", new MetaError("invalid response", "invalid_response", 404), 502, "meta_error", undefined],
+  ] as const) {
+    const value = await fixture(t, { targetError: metaError });
+    const app = await buildApp({ serviceToken: "service-token", handlers: createOperationHandlers(value.operations, "openclaw:user-1") });
+    t.after(() => app.close());
+    const response = await app.inject({
+      method: "POST",
+      url: "/v1/operations",
+      headers: { authorization: "Bearer service-token", "content-type": "application/json", "x-request-id": `request-proposal-${name}`, "idempotency-key": `idempotency-proposal-${name}` },
+      payload: request,
+    });
+
+    assert.equal(response.statusCode, expectedStatus, name);
+    assert.equal(response.json().code, expectedCode, name);
+    assert.equal(response.headers["retry-after"], retryAfter, name);
+    assert.equal(value.db.prepare("SELECT count(*) AS count FROM operations").get()!.count, 0, name);
+  }
 });
 
 test("preserves idempotency across concurrency and restart while rejecting expired media", async (t) => {

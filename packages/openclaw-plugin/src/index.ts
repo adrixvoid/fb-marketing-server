@@ -2,11 +2,10 @@ import { definePluginEntry, type OpenClawPluginApi } from "openclaw/plugin-sdk/p
 import { mergeInboundPathRoots } from "openclaw/plugin-sdk/channel-inbound";
 import {
   TOOL_NAMES,
-  TrustedAttachmentStore,
-  attachmentContextKey,
   createGatewayClient,
   createKeychainSecretProvider,
   createOpenClawRegistration,
+  createStageMediaCommandHandler,
   parsePluginConfig,
 } from "./core.js";
 
@@ -20,22 +19,20 @@ function register(api: OpenClawPluginApi) {
     ...(config.timeoutMs === undefined ? {} : { timeoutMs: config.timeoutMs }),
   });
   const gatewayWithSecrets = { ...gateway, secret };
-  const attachments = new TrustedAttachmentStore(roots);
+  const handleStageMediaCommand = createStageMediaCommandHandler();
 
   api.on("inbound_claim", (event, context) => {
-    const metadata = event.metadata ?? {};
-    const paths = Array.isArray(metadata.mediaPaths) ? metadata.mediaPaths.filter((path): path is string => typeof path === "string") : [];
-    const types = Array.isArray(metadata.mediaTypes) ? metadata.mediaTypes.filter((type): type is string => typeof type === "string") : [];
-    if (paths.length > 0) attachments.capture(attachmentContextKey({
-      channel: context.channelId,
-      account: context.accountId,
-      conversation: context.conversationId,
-      sender: context.senderId,
-    }), paths, types, { channel: context.channelId, ...(context.messageId === undefined ? {} : { messageId: context.messageId }) });
-    return { handled: false };
+    const ownerAllowFrom = api.config.commands?.ownerAllowFrom?.filter((value): value is string => typeof value === "string");
+    return handleStageMediaCommand({
+      event,
+      context,
+      config: { ...config, attachmentRoots: roots },
+      ...(ownerAllowFrom === undefined ? {} : { ownerAllowFrom }),
+      gateway: gatewayWithSecrets,
+    });
   });
 
-  api.registerTool((toolContext) => createOpenClawRegistration({ config, gateway: gatewayWithSecrets, attachments, toolContext }).tools as never, { names: [...TOOL_NAMES] });
+  api.registerTool(() => createOpenClawRegistration({ config, gateway: gatewayWithSecrets }).tools as never, { names: [...TOOL_NAMES] });
   for (const command of createOpenClawRegistration({ config, gateway: gatewayWithSecrets }).commands) api.registerCommand(command as never);
 }
 

@@ -4,7 +4,7 @@ import type { Context, HandlerMap } from "openapi-backend";
 import type { ContractResponse } from "./contract.js";
 import { requestId } from "./request-id.js";
 import type { components } from "./generated/openapi.js";
-import { MetaError, type AsyncInsightsRequest, type MetaPageRequest, type MetaRequest } from "./meta-client.js";
+import { isMetaRateLimit, MetaError, safeMetaRetryAfter, type AsyncInsightsRequest, type MetaPageRequest, type MetaRequest } from "./meta-client.js";
 import { resolveScope, type ResolvedScope } from "./scope.js";
 
 type ScopeResponse = components["schemas"]["ResolvedScope"];
@@ -617,7 +617,7 @@ function errorResponse(context: Context, id: string, error: unknown): ContractRe
     title = status === 422 ? "Unsupported query" : status === 409 ? "Scope conflict" : "Bad request";
     detail = error.message;
   } else if (error instanceof MetaError) {
-    status = error.status === 429 ? 429 : 502;
+    status = isMetaRateLimit(error) ? 429 : 502;
     code = status === 429 ? "rate_limited" : "meta_error";
     title = status === 429 ? "Rate limited" : "Upstream error";
     detail = title;
@@ -633,7 +633,7 @@ function errorResponse(context: Context, id: string, error: unknown): ContractRe
   return {
     statusCode: status,
     mediaType: "application/problem+json",
-    headers: { "x-request-id": id, ...(status === 429 && error instanceof MetaError && error.retryAfterSeconds !== undefined ? { "retry-after": String(error.retryAfterSeconds) } : {}) },
+    headers: { "x-request-id": id, ...(status === 429 && error instanceof MetaError && safeMetaRetryAfter(error) !== undefined ? { "retry-after": String(safeMetaRetryAfter(error)) } : {}) },
     body: {
       type: `urn:fb-marketing-server:${code}`,
       title,

@@ -36,6 +36,8 @@ npm run build
 
 Continue with the [local OpenClaw setup guide](docs/openclaw-local-setup.md) to configure Keychain safely, start in the foreground, verify health, and only then enable optional LaunchAgent persistence. The service listens on `http://127.0.0.1:3000`; the host is fixed to loopback.
 
+After authorized scope provisioning, stage one same-message Telegram attachment outside model dispatch with `/stage-ad-media <client_id> <ad_account_id>`. The [setup guide](docs/openclaw-local-setup.md#trusted-telegram-attachments) defines the exact owner, freshness, type, path-confinement, and reply rules.
+
 ### Optional LaunchAgent
 
 The LaunchAgent is a per-user macOS service that starts the local gateway automatically after login, without keeping a terminal open. Its plist lives in `~/Library/LaunchAgents/`, application data in `~/Library/Application Support/fb-marketing-server/`, and private logs in `~/Library/Logs/fb-marketing-server/`; this is local persistence, not a production deployment.

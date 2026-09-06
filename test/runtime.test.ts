@@ -5,7 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { openDatabase } from "../src/db.js";
-import { defaultRuntimePaths, createRuntime, loadProductionEnvironment, runtimeEnvironment } from "../src/runtime.js";
+import { defaultRuntimePaths, createRuntime, isSemanticTargetFailure, loadProductionEnvironment, runtimeEnvironment, validatedMetaTarget } from "../src/runtime.js";
+import { MetaError } from "../src/meta-client.js";
 import { encryptCredential, type SecretProvider } from "../src/secrets.js";
 import { signOwnerProof } from "../src/approval.js";
 import { canonicalPayload } from "../src/operations.js";
@@ -19,6 +20,35 @@ class FakeSecrets implements SecretProvider {
     return true;
   }
 }
+
+test("binds Meta mutation targets to their response type and resolved Ad Account", () => {
+  const cases = [
+    ["campaign", { id: "campaign-1", account_id: "123", objective: "OUTCOME_SALES" }],
+    ["ad_set", { id: "adset-1", account_id: { id: "act_123" }, optimization_goal: "OFFSITE_CONVERSIONS" }],
+    ["ad", { id: "ad-1", account_id: "act_123", creative: { id: "creative-1" } }],
+  ] as const;
+  for (const [objectType, response] of cases) {
+    const objectId = String(response.id);
+    assert.equal(validatedMetaTarget(response, { objectType, objectId, adAccountId: "act_123" }), objectId);
+    assert.equal(validatedMetaTarget(response, { objectType, objectId, adAccountId: "act_999" }), undefined);
+    assert.equal(validatedMetaTarget(response, { objectType: objectType === "campaign" ? "ad" : "campaign", objectId, adAccountId: "act_123" }), undefined);
+    assert.equal(validatedMetaTarget({ ...response, id: "other" }, { objectType, objectId, adAccountId: "act_123" }), undefined);
+  }
+});
+
+test("maps only semantic Meta target failures to incompatibility", () => {
+  assert.equal(isSemanticTargetFailure(new MetaError("invalid target", "meta_100", 400)), true);
+  assert.equal(isSemanticTargetFailure(new MetaError("not found", "meta_100", 404)), true);
+  for (const error of [
+    new MetaError("timeout", "timeout"),
+    new MetaError("transient target failure", "meta_100", 400, undefined, true),
+    new MetaError("transient not found", "meta_100", 404, undefined, true),
+    new MetaError("invalid response", "invalid_response", 400),
+    new MetaError("malformed not found", "invalid_response", 404),
+    new MetaError("rate limited", "meta_4", 429, 30, true),
+    new MetaError("upstream failed", "upstream_error", 502, undefined, true),
+  ]) assert.equal(isSemanticTargetFailure(error), false);
+});
 
 function mediaMultipart() {
   const boundary = "runtime-media-boundary";

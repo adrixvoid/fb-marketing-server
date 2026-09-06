@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, mkdir, open, readdir, realpath, rename, unlink } from "node:fs/promises";
+import { lstat, mkdir, open, readFile, readdir, realpath, rename, unlink } from "node:fs/promises";
 import { join, relative, resolve, sep } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { fileTypeFromBuffer } from "file-type";
@@ -38,16 +38,21 @@ export interface AttachmentMetadata {
   alt_text?: string;
 }
 
-export interface StageMediaInput {
-  actor: string;
-  requestId: string;
+interface StageMediaDetails {
   clientId: string;
   adAccountId: string;
   attachment: AttachmentMetadata;
+}
+
+interface StageMediaStream {
+  actor: string;
+  requestId: string;
   declaredFileType: string;
   bytes: AsyncIterable<Uint8Array>;
   signal?: AbortSignal;
 }
+
+export type StageMediaInput = StageMediaStream & (StageMediaDetails | { complete: () => StageMediaDetails });
 
 interface MediaOptions {
   db: DatabaseSync;
@@ -307,14 +312,17 @@ export async function createMediaService({
   }
 
   async function stageInternal(input: StageMediaInput) {
-    if (!validMetadata(input.attachment) || input.declaredFileType !== input.attachment.declared_content_type) {
-      throw new MediaError("Attachment metadata is invalid", 422, "media_invalid");
-    }
-    let scope: ResolvedScope;
-    try {
-      scope = resolveScope(db, { clientId: input.clientId, adAccountId: input.adAccountId }, { task: "ADVERTISE", permission: "ads_management" });
-    } catch {
-      throw new MediaError("Scope is not authorized", 409, "client_account_mismatch");
+    let completed: StageMediaDetails | undefined = "complete" in input ? undefined : input;
+    let scope: ResolvedScope | undefined;
+    if (completed !== undefined) {
+      if (!validMetadata(completed.attachment) || input.declaredFileType !== completed.attachment.declared_content_type) {
+        throw new MediaError("Attachment metadata is invalid", 422, "media_invalid");
+      }
+      try {
+        scope = resolveScope(db, { clientId: completed.clientId, adAccountId: completed.adAccountId }, { task: "ADVERTISE", permission: "ads_management" });
+      } catch {
+        throw new MediaError("Scope is not authorized", 409, "client_account_mismatch");
+      }
     }
     await assertMediaRoot();
     const temporaryName = randomUUID();
@@ -329,7 +337,6 @@ export async function createMediaService({
       throw error;
     }
     const digest = createHash("sha256");
-    const chunks: Buffer[] = [];
     const iterator = input.bytes[Symbol.asyncIterator]();
     const deadline = Date.now() + timeoutMs;
     let size = 0;
@@ -344,7 +351,6 @@ export async function createMediaService({
         size += chunk.length;
         if (size > maxBytes) throw new MediaError("Attachment is too large", 413, "media_too_large");
         digest.update(chunk);
-        chunks.push(chunk);
         await handle.write(chunk);
       }
       if (size === 0) throw new MediaError("Attachment is empty", 422, "media_invalid");
@@ -361,7 +367,21 @@ export async function createMediaService({
     }
 
     try {
-      const bytes = Buffer.concat(chunks, size);
+      completed ??= "complete" in input ? input.complete() : input;
+      const completedInput = completed;
+      if (!validMetadata(completedInput.attachment) || input.declaredFileType !== completedInput.attachment.declared_content_type) {
+        throw new MediaError("Attachment metadata is invalid", 422, "media_invalid");
+      }
+      if (scope === undefined) {
+        try {
+          scope = resolveScope(db, { clientId: completedInput.clientId, adAccountId: completedInput.adAccountId }, { task: "ADVERTISE", permission: "ads_management" });
+        } catch {
+          throw new MediaError("Scope is not authorized", 409, "client_account_mismatch");
+        }
+      }
+      const authorizedScope = scope;
+      if (authorizedScope === undefined) throw new Error("Scope authorization did not complete");
+      const bytes = await readFile(temporaryPath);
       const detected = await fileTypeFromBuffer(bytes);
       const accepted = detected === undefined ? undefined : allowedTypes.get(detected.mime);
       if (
@@ -396,16 +416,16 @@ export async function createMediaService({
                storage_name, status, created_at, expires_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'staged', ?, ?)
           `).run(
-            mediaId, scope.clientId, scope.adAccountId, scope.generationId, sha256, accepted.mediaType,
-            detected!.mime, size, input.attachment.original_filename, input.attachment.attachment_id,
-            input.attachment.alt_text ?? null, input.actor, input.requestId, storageName,
+            mediaId, authorizedScope.clientId, authorizedScope.adAccountId, authorizedScope.generationId, sha256, accepted.mediaType,
+            detected!.mime, size, completedInput.attachment.original_filename, completedInput.attachment.attachment_id,
+            completedInput.attachment.alt_text ?? null, input.actor, input.requestId, storageName,
             createdAt.toISOString(), expiresAt.toISOString(),
           );
           appendAudit(db, {
             actor: input.actor,
-            clientId: scope.clientId,
-            adAccountId: scope.adAccountId,
-            generationId: scope.generationId,
+            clientId: authorizedScope.clientId,
+            adAccountId: authorizedScope.adAccountId,
+            generationId: authorizedScope.generationId,
             operation: "stage_media",
             correlationId: input.requestId,
             occurredAt: createdAt.toISOString(),
@@ -417,7 +437,7 @@ export async function createMediaService({
         throw error;
       }
       return {
-        scope: publicScope(scope),
+        scope: publicScope(authorizedScope),
         media: {
           media_id: mediaId,
           sha256,
@@ -439,7 +459,19 @@ export async function createMediaService({
     try {
       return await stageInternal(input);
     } catch (error) {
-      auditFailure(input, error instanceof MediaError ? error.code : "media_invalid");
+      let details: StageMediaDetails | undefined = "complete" in input ? undefined : input;
+      if ("complete" in input) {
+        try {
+          details = input.complete();
+        } catch {
+          details = undefined;
+        }
+      }
+      auditFailure({
+        actor: input.actor,
+        requestId: input.requestId,
+        ...(details === undefined ? {} : { clientId: details.clientId, adAccountId: details.adAccountId }),
+      }, error instanceof MediaError ? error.code : "media_invalid");
       throw error;
     }
   }
@@ -566,50 +598,37 @@ export function createMediaHandlers(service: MediaService, actor: string): Handl
         }
         const abort = new AbortController();
         rawRequest.raw.once("aborted", () => abort.abort());
-        const chunks: Buffer[] = [];
-        const iterator = file.file[Symbol.asyncIterator]();
-        const deadline = Date.now() + DEFAULT_TIMEOUT_MS;
-        try {
-          while (true) {
-            const remaining = deadline - Date.now();
-            if (remaining <= 0) throw new MediaError("Media upload timed out", 422, "media_invalid");
-            const part = await nextWithDeadline(iterator.next(), abort.signal, remaining);
-            if (part.done) break;
-            chunks.push(Buffer.from(part.value));
+        const complete = () => {
+          const attachmentValue = fields.get("attachment");
+          const attachment = typeof attachmentValue === "string" ? JSON.parse(attachmentValue) as unknown : attachmentValue;
+          clientId = typeof fields.get("client_id") === "string" ? fields.get("client_id") as string : undefined;
+          adAccountId = typeof fields.get("ad_account_id") === "string" ? fields.get("ad_account_id") as string : undefined;
+          if (!clientId || !adAccountId || attachment === null || typeof attachment !== "object" || Array.isArray(attachment)) {
+            throw new MediaError("Multipart fields are invalid", 422, "media_invalid");
           }
-        } catch (error) {
-          file.file.destroy();
-          void iterator.return?.();
-          throw error;
-        }
-        if (file.file.truncated) throw new MediaError("Attachment is too large", 413, "media_too_large");
-        while (true) {
-          const extra = await parts.next();
-          if (extra.done) break;
-          if (extra.value.type === "file") {
-            extra.value.file.destroy();
-            throw new MediaError("Multipart contains extra parts", 422, "media_invalid");
-          }
-          addField(extra.value);
-        }
-        const attachmentValue = fields.get("attachment");
-        const attachment = typeof attachmentValue === "string" ? JSON.parse(attachmentValue) as unknown : attachmentValue;
-        clientId = typeof fields.get("client_id") === "string" ? fields.get("client_id") as string : undefined;
-        adAccountId = typeof fields.get("ad_account_id") === "string" ? fields.get("ad_account_id") as string : undefined;
-        if (!clientId || !adAccountId || attachment === null || typeof attachment !== "object" || Array.isArray(attachment)) {
-          throw new MediaError("Multipart fields are invalid", 422, "media_invalid");
-        }
-        const metadata = attachment as AttachmentMetadata;
-        if (file.filename !== metadata.original_filename) throw new MediaError("Attachment filename does not match metadata", 422, "media_invalid");
+          const metadata = attachment as AttachmentMetadata;
+          if (file.filename !== metadata.original_filename) throw new MediaError("Attachment filename does not match metadata", 422, "media_invalid");
+          return { clientId, adAccountId, attachment: metadata };
+        };
         const stageInput: StageMediaInput = {
           actor,
           requestId: id,
-          clientId,
-          adAccountId,
-          attachment: metadata,
           declaredFileType: file.mimetype,
-          bytes: (async function* () { for (const chunk of chunks) yield chunk; })(),
+          bytes: (async function* () {
+            for await (const chunk of file.file) yield chunk;
+            if (file.file.truncated) throw new MediaError("Attachment is too large", 413, "media_too_large");
+            while (true) {
+              const extra = await parts.next();
+              if (extra.done) break;
+              if (extra.value.type === "file") {
+                extra.value.file.destroy();
+                throw new MediaError("Multipart contains extra parts", 422, "media_invalid");
+              }
+              addField(extra.value);
+            }
+          })(),
           signal: abort.signal,
+          complete,
         };
         stageStarted = true;
         const result = await service.stage(stageInput);

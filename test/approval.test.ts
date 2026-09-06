@@ -9,7 +9,8 @@ import { ApprovalError, createApprovalHandlers, createApprovalService, signOwner
 import { buildApp } from "../src/app.js";
 import { openDatabase } from "../src/db.js";
 import { createMediaService } from "../src/media.js";
-import { createOperationsService } from "../src/operations.js";
+import { OperationError, createOperationsService } from "../src/operations.js";
+import { MetaError } from "../src/meta-client.js";
 import type { SecretProvider } from "../src/secrets.js";
 
 const now = new Date("2026-08-19T12:00:00.000Z");
@@ -50,6 +51,7 @@ function seed(db: ReturnType<typeof openDatabase>) {
 async function fixture(t: TestContext, options: {
   campaign?: boolean;
   failRevalidation?: boolean;
+  revalidationError?: Error;
   crossExpiryDuringRevalidation?: boolean;
   rotateGenerationDuringTarget?: boolean;
   rotateGenerationAfterRevalidation?: boolean;
@@ -105,10 +107,10 @@ async function fixture(t: TestContext, options: {
       assets: [{ asset_type: "page", page_id: "page-1", name: "Page" }, { asset_type: "pixel", pixel_id: "pixel-1", name: "Pixel" }],
       capabilities: { sales_website: { status: "available" }, leads_website: { status: "available" }, leads_instant_form: { status: "available" } },
     }),
-    validateTarget: async () => {
+    validateTarget: async (input) => {
       targetChecks += 1;
       if (options.rotateGenerationDuringTarget && targetChecks === 2) rotateGeneration();
-      return true;
+      return input.objectId;
     },
   });
   const proposal = await operations.propose({
@@ -136,8 +138,10 @@ async function fixture(t: TestContext, options: {
     secrets,
     ownerIdentity: owner,
     now: () => current,
-    revalidate: options.failRevalidation
-      ? async () => { throw new Error("stale"); }
+    revalidate: options.revalidationError
+      ? async () => { throw options.revalidationError; }
+      : options.failRevalidation
+      ? async () => { throw new OperationError("stale", 409, "operation_stale"); }
       : options.crossExpiryDuringRevalidation
         ? async (input) => { const result = await operations.revalidate(input); current = new Date(proposal.operation.expires_at); return result; }
         : options.rotateGenerationAfterRevalidation
@@ -267,6 +271,48 @@ test("reports execution-time staleness as an operation lifecycle conflict", asyn
     (error: unknown) => error instanceof ApprovalError && error.status === 409 && error.code === "operation_stale",
   );
   assert.equal(value.db.prepare("SELECT count(*) AS count FROM approval_decisions").get()!.count, 1);
+});
+
+test("approval preserves retryable revalidation status without marking the proposal stale", async (t) => {
+  for (const [name, upstream, expectedStatus, expectedCode, retryAfter] of [
+    ["rate-limit", new MetaError("limited", "meta_4", 400, 17, true), 429, "rate_limited", "17"],
+    ["upstream", new MetaError("unavailable", "upstream_error", 503, undefined, true), 502, "meta_error", undefined],
+  ] as const) {
+    const value = await fixture(t, { revalidationError: upstream });
+    const operationId = value.proposal.operation.operation_id;
+    const signed = proofFor(operationId, "approved", expectedStatus === 429 ? 50 : 51);
+    const app = await buildApp({ serviceToken: "service-token", handlers: createApprovalHandlers(value.approval, owner) });
+    t.after(() => app.close());
+    const response = await app.inject({ method: "POST", url: signed.path, headers: {
+      authorization: "Bearer service-token", "x-openclaw-owner-command": signed.proof, "x-request-id": `request-${name}`,
+    } });
+
+    assert.equal(response.statusCode, expectedStatus, name);
+    assert.equal(response.json().code, expectedCode, name);
+    assert.equal(response.headers["retry-after"], retryAfter, name);
+    assert.equal(value.db.prepare("SELECT status FROM operations WHERE id = ?").get(operationId)!.status, "pending", name);
+    assert.equal(value.db.prepare("SELECT count(*) AS count FROM approval_decisions WHERE operation_id = ?").get(operationId)!.count, 0, name);
+  }
+});
+
+test("approval normalizes a post-decision pre-write revalidation failure for retry", async (t) => {
+  const value = await fixture(t, {
+    executeApproved: async () => { throw new MetaError("limited", "meta_17", 400, 11, true); },
+  });
+  const operationId = value.proposal.operation.operation_id;
+  const signed = proofFor(operationId, "approved", 52);
+  const app = await buildApp({ serviceToken: "service-token", handlers: createApprovalHandlers(value.approval, owner) });
+  t.after(() => app.close());
+
+  const response = await app.inject({ method: "POST", url: signed.path, headers: {
+    authorization: "Bearer service-token", "x-openclaw-owner-command": signed.proof, "x-request-id": "request-execution-revalidation",
+  } });
+
+  assert.equal(response.statusCode, 429);
+  assert.equal(response.json().code, "rate_limited");
+  assert.equal(response.headers["retry-after"], "11");
+  assert.equal(value.db.prepare("SELECT status FROM operations WHERE id = ?").get(operationId)!.status, "pending");
+  assert.equal(value.db.prepare("SELECT count(*) AS count FROM approval_decisions WHERE operation_id = ?").get(operationId)!.count, 1);
 });
 
 test("owner route returns correlated lifecycle next actions for stale execution", async (t) => {

@@ -311,9 +311,10 @@ paths:
       summary: Stage a trusted OpenClaw chat attachment
       description: |
         Accepts multipart binary only, never a local path or URL. The service verifies
-        actual content type and limits, hashes bytes, and stages privately. Media is
-        scope-bound and removed no later than 12 hours after staging or when its linked
-        operation completes or expires, whichever is earlier.
+        actual content type and limits, hashes bytes, and streams them to private disk.
+        One bounded whole-file buffer is used afterward for content validation. Media
+        is scope-bound and removed no later than 12 hours after staging or when its
+        linked operation completes or expires, whichever is earlier.
       operationId: stageMedia
       x-requirements: [FR-1, FR-3, FR-6, SEC-3]
       parameters:
@@ -361,9 +362,9 @@ paths:
       tags: [Operations]
       summary: Create an immutable mutation proposal
       description: |
-        Creates a typed pending operation; it does not execute it. Meta validate-only
-        preflight is used where applicable before persistent creation and is audited,
-        but never replaces owner approval. expires_at is exactly created_at + 12 hours.
+        Creates a typed pending operation; it does not execute it. The service validates
+        supported local semantics, scoped assets, media, and mutation targets before
+        persistent creation. expires_at is exactly created_at + 12 hours.
         Idempotency-Key binds authenticated caller, operation type, client/account, and
         canonical payload hash. Same key and payload returns the existing operation;
         different payload returns 409 idempotency_conflict. The key remains reserved
@@ -802,7 +803,7 @@ components:
           schema:
             $ref: "#/components/schemas/Problem422Media"
     UnprocessableOperation:
-      description: Operation payload, campaign combination, preflight, or bound assets are semantically invalid.
+      description: Operation payload, campaign combination, mutation target, or bound assets are semantically invalid.
       headers:
         X-Request-ID:
           $ref: "#/components/headers/RequestId"
@@ -2532,7 +2533,6 @@ components:
                       [
                         unsupported_campaign_variant,
                         unsupported_campaign_combination,
-                        meta_preflight_rejected,
                         asset_incompatible,
                         operation_semantics_invalid,
                       ],

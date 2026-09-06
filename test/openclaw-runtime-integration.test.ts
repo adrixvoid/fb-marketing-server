@@ -12,10 +12,9 @@ import { createOperationHandlers, createOperationsService } from "../src/operati
 import { createPacingHandlers, createPacingService } from "../src/pacing.js";
 import { createReportingHandlers, createReportingService } from "../src/reporting.js";
 import {
-  TrustedAttachmentStore,
-  attachmentContextKey,
   createGatewayClient,
   createOpenClawRegistration,
+  handleStageMediaCommand,
   type Gateway,
 } from "../packages/openclaw-plugin/src/core.js";
 
@@ -137,17 +136,10 @@ function gatewayFor(app: FastifyInstance, urls: string[] = []): Gateway {
   });
 }
 
-function registration(gateway: Gateway, options: { attachments?: TrustedAttachmentStore; sender?: string; conversation?: string } = {}) {
+function registration(gateway: Gateway) {
   return createOpenClawRegistration({
     config: pluginConfig,
     gateway,
-    ...(options.attachments === undefined ? {} : { attachments: options.attachments }),
-    toolContext: {
-      messageChannel: "discord",
-      agentAccountId: "main",
-      requesterSenderId: options.sender ?? "sender-1",
-      deliveryContext: { to: options.conversation ?? "chat-1" },
-    },
   });
 }
 
@@ -155,40 +147,27 @@ function tool(value: ReturnType<typeof createOpenClawRegistration>, name: string
   return value.tools.find((candidate) => candidate.name === name)!;
 }
 
-test("plugin upload sends canonical trusted metadata through actual Fastify media validation", async (t) => {
+test("same-message owner command sends canonical trusted metadata through actual Fastify media validation", async (t) => {
   const { root, db, app } = await fixture(t);
   const path = join(root, "creative.png");
   await writeFile(path, png);
-  const attachments = new TrustedAttachmentStore([root]);
-  const key = attachmentContextKey({ channel: "discord", account: "main", conversation: "chat-1", sender: "sender-1" })!;
-  attachments.capture(key, [path], ["image/png"], { channel: "discord", messageId: "message-1" });
-
-  await assert.rejects(tool(registration(gatewayFor(app), { attachments, sender: "sender-2" }), "upload_chat_media").execute("wrong-sender", {
-    client_id: "client-us", ad_account_id: "act_us",
-  }), /trusted attachment/i);
-  await assert.rejects(tool(registration(gatewayFor(app), { attachments, conversation: "chat-2" }), "upload_chat_media").execute("wrong-conversation", {
-    client_id: "client-us", ad_account_id: "act_us",
-  }), /trusted attachment/i);
-
-  const result = await tool(registration(gatewayFor(app), { attachments }), "upload_chat_media").execute("upload-1", {
-    client_id: "client-us", ad_account_id: "act_us",
-  }) as { details: Record<string, any> };
+  const result = await handleStageMediaCommand({
+    config: { ...pluginConfig, attachmentRoots: [root] }, gateway: gatewayFor(app), ownerAllowFrom: ["telegram:sender-1"], now: () => at.getTime(),
+    context: { channelId: "telegram", accountId: "main", conversationId: "chat-1", senderId: "sender-1", messageId: "message-1" },
+    event: {
+      content: "/stage-ad-media client-us act_us", timestamp: at.getTime(), channel: "telegram", senderId: "sender-1", messageId: "message-1",
+      commandAuthorized: true, senderIsOwner: true, media: [{ path, contentType: "image/png", messageId: "message-1" }],
+    },
+  });
   const row = db.prepare("SELECT attachment_id, original_filename, correlation_id, status FROM staged_media").get()!;
   assert.deepEqual({ original_filename: row.original_filename, correlation_id: row.correlation_id, status: row.status }, {
-    original_filename: "creative.png", correlation_id: result.details.request_id, status: "staged",
+    original_filename: "creative.png", correlation_id: String(row.correlation_id), status: "staged",
   });
   assert.match(String(row.attachment_id), /^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$/);
   assert.doesNotMatch(String(row.attachment_id), /message-1|creative|sender|chat|discord/i);
-  assert.deepEqual(result.details.media.status, "staged");
-  assert.equal(result.details.scope.client_id, "client-us");
-  assert.match(String(result.details.request_id), /^[0-9a-f-]{36}$/i);
+  assert.match(result.reply!.text, /Staged [0-9a-f-]{36} \(image\/png, 68 bytes, SHA-256 [a-f0-9]{64}\) for client-us\/act_us/);
   assert.doesNotMatch(JSON.stringify(result), new RegExp(`${root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}|https?://|schema`, "i"));
-
-  const absent = new TrustedAttachmentStore([root]);
-  absent.capture(key, [path], ["image/png"], { channel: "discord", messageId: "" });
-  await assert.rejects(tool(registration(gatewayFor(app), { attachments: absent }), "upload_chat_media").execute("missing-message", {
-    client_id: "client-us", ad_account_id: "act_us",
-  }), /trusted attachment/i);
+  assert.equal(result.handled, true);
 });
 
 test("decimal-safe independent budgets retain currencies without ranking or aggregation", async (t) => {

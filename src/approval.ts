@@ -8,7 +8,8 @@ import { appendAudit, transaction } from "./db.js";
 import type { SecretProvider } from "./secrets.js";
 import { resolveScope } from "./scope.js";
 import { requestId } from "./request-id.js";
-import { operationExecutionView, operationNextAction, operationReview } from "./operations.js";
+import { isMetaRateLimit, MetaError, safeMetaRetryAfter } from "./meta-client.js";
+import { OperationError, operationExecutionView, operationNextAction, operationReview } from "./operations.js";
 
 type Operation = components["schemas"]["Operation"];
 type Decision = "approved" | "rejected";
@@ -26,8 +27,8 @@ export class ApprovalError extends Error {
 
   constructor(
     message: string,
-    readonly status: 400 | 403 | 404 | 409 | 410 | 429,
-    readonly code: "validation_error" | "forbidden" | "not_found" | "client_account_mismatch" | "operation_stale" | "operation_already_resolved" | "operation_expired" | "rate_limited",
+    readonly status: 400 | 403 | 404 | 409 | 410 | 429 | 502,
+    readonly code: "validation_error" | "forbidden" | "not_found" | "client_account_mismatch" | "operation_stale" | "operation_already_resolved" | "operation_expired" | "rate_limited" | "meta_error",
     readonly retryAfterSeconds?: number,
   ) {
     super(message);
@@ -345,15 +346,16 @@ export function createApprovalService({
     if (input.decision === "approved") {
       try {
         await revalidate({ actor: input.actor, requestId: input.requestId, operationId: input.operationId });
-      } catch {
+      } catch (error) {
+        if (!(error instanceof OperationError)) throw error;
         transaction(db, () => {
           db.prepare("UPDATE operations SET status = 'stale' WHERE id = ? AND status = 'pending'").run(input.operationId);
           linkedAudit(preliminary.row, input, "failed", "revalidation", "operation_stale");
         });
         await cleanupOperationMedia(input.operationId, "invalid");
-        const error = new ApprovalError("Operation revalidation failed", 409, "operation_stale");
-        error.auditRecorded = true;
-        throw error;
+        const stale = new ApprovalError("Operation revalidation failed", 409, "operation_stale");
+        stale.auditRecorded = true;
+        throw stale;
       }
     }
 
@@ -445,8 +447,13 @@ export function createApprovalService({
       }
       return operation;
     } catch (error) {
-      if (!(error instanceof ApprovalError) || !error.auditRecorded) auditFailure(input, error);
-      throw error;
+      const normalized = error instanceof MetaError
+        ? isMetaRateLimit(error)
+          ? new ApprovalError("Operation revalidation was rate limited", 429, "rate_limited", safeMetaRetryAfter(error))
+          : new ApprovalError("Operation revalidation upstream failed", 502, "meta_error")
+        : error;
+      if (!(normalized instanceof ApprovalError) || !normalized.auditRecorded) auditFailure(input, normalized);
+      throw normalized;
     }
   }
 
@@ -460,10 +467,10 @@ function approvalProblem(id: string, error: ApprovalError): ContractResponse {
   return {
     statusCode: error.status,
     mediaType: "application/problem+json",
-    headers: { "x-request-id": id, ...(error.status === 429 ? { "retry-after": String(error.retryAfterSeconds) } : {}) },
+    headers: { "x-request-id": id, ...(error.status === 429 && error.retryAfterSeconds !== undefined ? { "retry-after": String(error.retryAfterSeconds) } : {}) },
     body: {
       type: `urn:fb-marketing-server:${error.code}`,
-      title: error.status === 400 ? "Bad request" : error.status === 403 ? "Forbidden" : error.status === 404 ? "Not found" : error.status === 410 ? "Gone" : error.status === 429 ? "Rate limited" : "Conflict",
+      title: error.status === 400 ? "Bad request" : error.status === 403 ? "Forbidden" : error.status === 404 ? "Not found" : error.status === 410 ? "Gone" : error.status === 429 ? "Rate limited" : error.status === 502 ? "Upstream error" : "Conflict",
       status: error.status,
       code: error.code,
       detail: error.message,

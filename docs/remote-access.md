@@ -11,7 +11,7 @@ npm run service:install
 npm run service:status
 ```
 
-The installer builds first, precreates the private data/log directories and mode-`0600` logs, atomically writes a mode-`0600` plist, validates it with `/usr/bin/plutil`, and loads it in the current user domain. It uses absolute Node/project paths because LaunchAgents do not load shell profiles. It starts at login but does not automatically restart a configuration or migration failure; repair the cause and run `npm run service:install` again.
+The installer builds first, precreates the private data/log directories and mode-`0600` logs, atomically writes a mode-`0600` plist, validates it with `/usr/bin/plutil`, and loads it in the current user domain. It uses absolute Node/project paths because LaunchAgents do not load shell profiles. It starts at login and restarts after an unexpected nonzero exit, with a 30-second throttle to prevent rapid restart loops. A clean exit remains stopped until login, manual kickstart, or reinstall.
 
 Logs are under `~/Library/Logs/fb-marketing-server/`. Remove only this job and plist with `npm run service:uninstall`.
 

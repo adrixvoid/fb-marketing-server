@@ -8,7 +8,7 @@ Define the model-visible read/propose tools and the separate deterministic owner
 
 ### Requirement: Curated model-visible tools
 
-The OpenClaw plugin MUST expose only `list_scopes`, `integration_status`, `get_capabilities`, `list_campaigns`, `query_insights`, `budget_summary`, `upload_chat_media`, `propose_operation`, and `get_operation` to model dispatch. Tool schemas MUST be a concise projection of the canonical API and MUST NOT expose arbitrary Graph forwarding, credentials, approval, or rejection.
+The OpenClaw plugin MUST expose only `list_scopes`, `integration_status`, `get_capabilities`, `list_campaigns`, `query_insights`, `budget_summary`, `propose_operation`, and `get_operation` to model dispatch. Tool schemas MUST be a concise projection of the canonical API and MUST NOT expose media staging, arbitrary Graph forwarding, credentials, approval, or rejection.
 
 #### Scenario: Tool registration
 
@@ -38,14 +38,14 @@ Read tools MUST execute after authorization and required scope resolution withou
 - WHEN `propose_operation` is invoked
 - THEN it MUST return a pending operation and MUST NOT execute it
 
-### Requirement: Trusted attachment tool boundary
+### Requirement: Deterministic same-message media staging
 
-`upload_chat_media` MUST obtain bytes and metadata only from host-trusted inbound attachment context supplied by the supported public SDK. Its model schema MUST NOT accept local paths or remote URLs, and it MUST fail closed when trusted context is absent.
+`/stage-ad-media <client_id> <ad_account_id>` MUST be parsed as exact command text in trusted `inbound_claim` context and MUST never pass through model dispatch. Before file or HTTP access it MUST require OpenClaw's authorized-sender and owner facts and exactly one configured channel-scoped owner. It MUST use only the same event's exact one fresh supported local attachment, reject missing, multiple, pending, expired, unsafe, out-of-root, or symlink inputs, and MUST NOT retain a mutable session-to-latest-message bridge. It MUST call the existing authenticated staging endpoint with explicit scope and return only safe staged metadata or a redacted error.
 
 #### Scenario: Missing host attachment
 
-- GIVEN model input names media but host-trusted bytes are absent
-- WHEN `upload_chat_media` runs
+- GIVEN model input names media but no authorized exact staging command owns one same-event attachment
+- WHEN media staging is attempted
 - THEN it MUST fail without staging media or calling Meta
 
 ### Requirement: Deterministic owner commands

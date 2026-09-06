@@ -5,7 +5,7 @@ import type { Context, HandlerMap } from "openapi-backend";
 import type { ContractResponse } from "./contract.js";
 import { requestId } from "./request-id.js";
 import type { components } from "./generated/openapi.js";
-import { MetaError, type AsyncInsightsRequest, type MetaRequest } from "./meta-client.js";
+import { isMetaRateLimit, MetaError, safeMetaRetryAfter, type AsyncInsightsRequest, type MetaRequest } from "./meta-client.js";
 import { resolveScope } from "./scope.js";
 
 const Exact = Decimal.clone({ precision: 50, rounding: Decimal.ROUND_HALF_EVEN });
@@ -280,14 +280,14 @@ export type PacingService = ReturnType<typeof createPacingService>;
 function problem(context: Context, id: string, error: unknown): ContractResponse {
   const message = error instanceof Error ? error.message : "";
   const meta = error instanceof MetaError;
-  const status = meta ? (error.status === 429 ? 429 : 502) : /scope/i.test(message) ? 409 : /budget/i.test(message) ? 404 : 400;
+  const status = meta ? (isMetaRateLimit(error) ? 429 : 502) : /scope/i.test(message) ? 409 : /budget/i.test(message) ? 404 : 400;
   const code = status === 429 ? "rate_limited" : status === 502 ? "meta_error" : status === 409 ? "client_account_mismatch" : status === 404 ? "not_found" : "validation_error";
   const title = status === 502 ? "Upstream error" : status === 429 ? "Rate limited" : status === 409 ? "Scope conflict" : status === 404 ? "Not found" : "Bad request";
   const query = context.request.query as Record<string, unknown>;
   return {
     statusCode: status,
     mediaType: "application/problem+json",
-    headers: { "x-request-id": id, ...(status === 429 && meta && error.retryAfterSeconds !== undefined ? { "retry-after": String(error.retryAfterSeconds) } : {}) },
+    headers: { "x-request-id": id, ...(status === 429 && meta && safeMetaRetryAfter(error) !== undefined ? { "retry-after": String(safeMetaRetryAfter(error)) } : {}) },
     body: {
       type: `urn:fb-marketing-server:${code}`,
       title,

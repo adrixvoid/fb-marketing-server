@@ -192,7 +192,7 @@ openclaw plugins inspect fb-marketing-server --runtime --json
 openclaw plugins list --enabled --json
 ```
 
-Expected result: `fb-marketing-server` is installed, enabled, and loaded from built `dist/index.js`. Its runtime registers these nine tools:
+Expected result: `fb-marketing-server` is installed, enabled, and loaded from built `dist/index.js`. Its runtime registers these eight model-visible tools:
 
 ```text
 list_scopes
@@ -201,16 +201,16 @@ get_capabilities
 list_campaigns
 query_insights
 budget_summary
-upload_chat_media
 propose_operation
 get_operation
 ```
 
-It also registers two owner-only commands:
+It also provides three deterministic owner-only command paths outside model dispatch:
 
 ```text
 /approve-ad <operation_id>
 /reject-ad <operation_id>
+/stage-ad-media <client_id> <ad_account_id>
 ```
 
 In your authorized Telegram chat, send:
@@ -247,7 +247,7 @@ npm run service:install
 npm run service:status
 ```
 
-Expected result: the status command shows the loaded user job `com.gentleman-programming.fb-marketing-server`. The installer builds the server, writes `~/Library/LaunchAgents/com.gentleman-programming.fb-marketing-server.plist`, and writes private logs under `~/Library/Logs/fb-marketing-server/`.
+Expected result: the status command shows the loaded user job `com.gentleman-programming.fb-marketing-server`. The installer builds the server, writes `~/Library/LaunchAgents/com.gentleman-programming.fb-marketing-server.plist`, and writes private logs under `~/Library/Logs/fb-marketing-server/`. The job restarts after an unexpected nonzero exit with a 30-second throttle; a clean exit remains stopped.
 
 Safe stop point: remove only the LaunchAgent and stop its process with:
 
@@ -259,7 +259,13 @@ Application data and Keychain records remain in place. Reinstall later with `npm
 
 ## Trusted Telegram attachments
 
-After Meta provisioning, attach exactly one fresh JPEG, PNG, or MP4 and ask OpenClaw to stage it for an explicit `<client_id>` and `<ad_account_id>` in the same message. The model must not supply a local path or URL. The attachment claim expires after five minutes and must resolve beneath the configured `<attachment-root>` to exactly one non-symlink file.
+After Meta provisioning, send exactly this command with exactly one JPEG, PNG, or MP4 attached to the same Telegram message:
+
+```text
+/stage-ad-media <client_id> <ad_account_id>
+```
+
+No additional identifier is required because trusted `inbound_claim` context already binds the command to that event's message and ordered attachment facts. The plugin claims the exact command before model dispatch, requires the authorized configured single owner before reading a file or calling HTTP, and rejects missing, multiple, still-staging, older-than-five-minutes, future-dated, unsupported, out-of-root, or symlink attachments. It calls the existing authenticated `/v1/media` endpoint with the explicit scope and replies only with media ID, content type, byte size, SHA-256, expiry, scope IDs, and request ID. It never stores a session-to-latest-message mapping or exposes local paths, tokens, Keychain values, authorization headers, or secrets to the model, chat, or logs.
 
 ## Troubleshooting
 
@@ -270,6 +276,7 @@ After Meta provisioning, attach exactly one fresh JPEG, PNG, or MP4 and ask Open
 | `EADDRINUSE` | Stop the other process on port `3000`, especially a previously installed LaunchAgent. Use another `PORT` only if you also update the health URL and plugin `baseUrl`. |
 | Plugin not loaded | Run `openclaw plugins inspect fb-marketing-server --runtime --json`; confirm version `2026.9.2`, enabled state, built `dist/index.js`, and the exact configuration fields, then restart the Gateway. |
 | Owner command says unauthorized | Confirm the Telegram numeric sender ID. Make Keychain `openclaw-owner-identity` and `commands.ownerAllowFrom` exactly `telegram:<numeric_user_id>`. A bare number, username, or multiple owners fails closed. |
+| Media staging fails | Put the exact `/stage-ad-media <client_id> <ad_account_id>` text and exactly one supported attachment in the same fresh owner message. Confirm the configured attachment root is narrow and contains the real non-symlink file. Do not paste paths or URLs into chat. |
 | Empty scopes | This is expected before trusted Meta provisioning. There is currently no supported live provisioning CLI. |
 | Capability unavailable | After provisioning, call `get_capabilities` for the exact pair and follow its diagnostic codes. Do not guess another account or credential. |
 | Ambiguous Meta write | Do not approve again or automatically retry. Read the operation, reconcile Meta state manually, and create a new proposal only after proving it cannot duplicate the first write. |

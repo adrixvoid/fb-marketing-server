@@ -6,7 +6,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { buildApp, type AppOptions } from "./app.js";
 import { createApprovalHandlers, createApprovalService, validOwnerIdentity } from "./approval.js";
 import { appendAudit, openDatabase, transaction } from "./db.js";
-import { createMetaClient, type MetaScope } from "./meta-client.js";
+import { createMetaClient, MetaError, type MetaScope } from "./meta-client.js";
 import { createMediaHandlers, createMediaService } from "./media.js";
 import { createExecutionService, createOperationHandlers, createOperationsService } from "./operations.js";
 import { createPacingHandlers, createPacingService } from "./pacing.js";
@@ -82,6 +82,30 @@ interface CredentialRow {
   auth_tag: string;
 }
 
+export function validatedMetaTarget(
+  data: Record<string, unknown>,
+  input: { objectType: "campaign" | "ad_set" | "ad"; objectId: string; adAccountId: string },
+): string | undefined {
+  const accountId = typeof data.account_id === "string"
+    ? data.account_id
+    : data.account_id !== null && typeof data.account_id === "object"
+      ? (data.account_id as { id?: unknown }).id
+      : undefined;
+  const typeMatches = input.objectType === "campaign"
+    ? typeof data.objective === "string" && data.objective.length > 0
+    : input.objectType === "ad_set"
+      ? typeof data.optimization_goal === "string" && data.optimization_goal.length > 0
+      : data.creative !== null && typeof data.creative === "object" && typeof (data.creative as { id?: unknown }).id === "string";
+  return data.id === input.objectId && typeof accountId === "string" &&
+    accountId.replace(/^act_/, "") === input.adAccountId.replace(/^act_/, "") && typeMatches
+    ? data.id
+    : undefined;
+}
+
+export function isSemanticTargetFailure(error: unknown): boolean {
+  return error instanceof MetaError && !error.transient && error.code === "meta_100" && (error.status === 400 || error.status === 404);
+}
+
 function credentialLoader(db: DatabaseSync, secrets: SecretProvider) {
   return async (scope: MetaScope) => {
     const row = db.prepare(`
@@ -148,11 +172,11 @@ export async function createRuntime(options: RuntimeOptions) {
     const meta = createMetaClient({
       fetch: options.fetch ?? globalThis.fetch,
       getCredentials: credentialLoader(db, secrets),
-      audit: (event) => transaction(db, () => {
+      audit: (event, executionStep) => transaction(db, () => {
         const auditId = appendAudit(db, event);
-        const step = db.prepare(`SELECT s.operation_id, s.execution_id, s.step_key, e.decision_id
+        const step = executionStep === undefined ? undefined : db.prepare(`SELECT s.operation_id, s.execution_id, s.step_key, e.decision_id
           FROM operation_steps s JOIN operation_executions e ON e.id = s.execution_id
-          WHERE s.correlation_id = ?`).get(event.correlationId) as {
+          WHERE s.execution_id = ? AND s.step_key = ?`).get(executionStep.executionId, executionStep.stepKey) as {
             operation_id: string; execution_id: string; step_key: string; decision_id: string;
           } | undefined;
         if (step !== undefined) db.prepare(`INSERT INTO operation_execution_audit_links
@@ -198,16 +222,26 @@ export async function createRuntime(options: RuntimeOptions) {
         return { assets, capabilities: snapshot!.capabilities };
       },
       validateTarget: async (input) => {
-        const result = await meta.request<{ id?: unknown }>({
-          method: "GET",
-          path: `/${input.objectId}`,
-          query: { fields: "id" },
-          scope: input.scope,
-          actor: input.actor,
-          correlationId: input.requestId,
-          operation: "validate_operation_target",
-        });
-        return result.data.id === input.objectId;
+        const discriminator = { campaign: "objective", ad_set: "optimization_goal", ad: "creative" } as const;
+        try {
+          const result = await meta.request<Record<string, unknown>>({
+            method: "GET",
+            path: `/${input.objectId}`,
+            query: { fields: `id,account_id,${discriminator[input.objectType]}` },
+            scope: input.scope,
+            actor: input.actor,
+            correlationId: input.requestId,
+            operation: "validate_operation_target",
+          });
+          return validatedMetaTarget(result.data, {
+            objectType: input.objectType,
+            objectId: input.objectId,
+            adAccountId: input.scope.adAccountId,
+          });
+        } catch (error) {
+          if (isSemanticTargetFailure(error)) return undefined;
+          throw error;
+        }
       },
       ...(options.now === undefined ? {} : { now: options.now }),
     });

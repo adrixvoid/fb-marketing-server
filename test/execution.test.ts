@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import test from "node:test";
 import { openDatabase } from "../src/db.js";
 import { MetaError } from "../src/meta-client.js";
-import { canonicalPayload, createExecutionService } from "../src/operations.js";
+import { OperationError, canonicalPayload, createExecutionService } from "../src/operations.js";
 
 const now = new Date("2026-08-19T12:00:00.000Z");
 const mediaBytes = Buffer.from("trusted-image");
@@ -69,11 +69,18 @@ function fixture() {
 function addApprovedOperation(db: ReturnType<typeof openDatabase>, id: string, type: string, payload: object, nonceByte: string, derived: object = {}) {
   const payloadJson = canonicalPayload(payload);
   const payloadHash = createHash("sha256").update(payloadJson).digest("hex");
+  const mutation = payload as { object_type?: string; object_id?: string };
+  const targetType = type === "update_object"
+    ? mutation.object_type
+    : type === "change_delivery" ? ({ Campaign: "campaign", AdSet: "ad_set", Ad: "ad" } as Record<string, string>)[mutation.object_type ?? ""] : undefined;
+  const storedDerived = Object.keys(derived).length > 0 || targetType === undefined
+    ? derived
+    : { target: { object_type: targetType, object_id: mutation.object_id, ad_account_id: "act_1" } };
   db.prepare(`INSERT INTO operations
     (id, actor, client_id, ad_account_id, generation_id, operation_type, payload_json, payload_hash,
      derived_json, status, created_at, expires_at)
     VALUES (?, 'openclaw', 'client-1', 'act_1', 'generation-1', ?, ?, ?, ?, 'pending', ?, ?)`)
-    .run(id, type, payloadJson, payloadHash, canonicalPayload(derived), now.toISOString(), "2026-08-20T00:00:00.000Z");
+    .run(id, type, payloadJson, payloadHash, canonicalPayload(storedDerived), now.toISOString(), "2026-08-20T00:00:00.000Z");
   const nonce = nonceByte.repeat(22);
   db.prepare(`INSERT INTO proof_nonces
     (nonce, owner_identity, operation_id, decision, body_hash, issued_at, consumed_at, correlation_id, purge_after)
@@ -123,7 +130,7 @@ function prepareBundleExecutionThroughCampaign(db: ReturnType<typeof openDatabas
 test("claims and audits an approved campaign under its original request ID", async (t) => {
   const { db } = fixture();
   t.after(() => db.close());
-  const calls: Array<{ path: string; body: unknown }> = [];
+  const calls: Array<{ path: string; body: unknown; executionStep?: { executionId: string; stepKey: string } }> = [];
   const responses = [
     { images: { upload: { hash: "image-hash-1" } } },
     { id: "campaign-1" },
@@ -139,8 +146,8 @@ test("claims and audits an approved campaign under its original request ID", asy
     readMedia: async () => ({ contentType: "image/png" as const, bytes: mediaBytes }),
     cleanupOperationMedia: async () => 1,
     meta: {
-      request: async (request: { path: string; body?: unknown }) => {
-        calls.push({ path: request.path, body: request.body });
+      request: async (request: { path: string; body?: unknown; executionStep?: { executionId: string; stepKey: string } }) => {
+        calls.push({ path: request.path, body: request.body, ...(request.executionStep === undefined ? {} : { executionStep: request.executionStep }) });
         return { data: responses[calls.length - 1], rate: {} };
       },
     },
@@ -154,6 +161,8 @@ test("claims and audits an approved campaign under its original request ID", asy
     "/act_1/adimages", "/act_1/campaigns", "/act_1/adsets", "/act_1/adcreatives", "/act_1/ads",
   ]);
   assert.deepEqual(calls.slice(1).map(({ body }) => (body as { status?: string }).status), ["PAUSED", "PAUSED", undefined, "PAUSED"]);
+  assert.equal(new Set(calls.map(({ executionStep }) => `${executionStep?.executionId}:${executionStep?.stepKey}`)).size, 5);
+  assert.deepEqual(calls.map(({ executionStep }) => executionStep?.stepKey), ["media:media-1", "campaign", "ad_set", "creative", "ad"]);
   assert.deepEqual(first.result, {
     status: "succeeded", completed_at: now.toISOString(),
     campaign: { object_id: "campaign-1", delivery_status: "PAUSED" },
@@ -631,6 +640,62 @@ test("executes approved updates, delivery changes, and exact local monthly budge
   assert.equal(db.prepare("SELECT count(*) AS count FROM operation_steps WHERE operation_id IN ('operation-update', 'operation-delivery', 'operation-budget')").get()!.count, 3);
 });
 
+test("executes a mutation only against its persisted authoritative target", async (t) => {
+  const { db } = fixture();
+  t.after(() => db.close());
+  addApprovedOperation(db, "operation-authoritative", "update_object", {
+    object_type: "campaign", object_id: "caller-supplied", changes: { name: "Renamed" },
+  }, "J", { target: { object_type: "campaign", object_id: "meta-authoritative", ad_account_id: "act_1" } });
+  const paths: string[] = [];
+  const execution = createExecutionService({
+    db, now: () => now, revalidate: async () => undefined,
+    readMedia: async () => { throw new Error("media must not be read"); }, cleanupOperationMedia: async () => 0,
+    meta: { request: async (request) => { paths.push(request.path); return { data: { success: true }, rate: {} }; } },
+  });
+
+  const result = await execution.execute({ operationId: "operation-authoritative", actor: "discord:owner", requestId: "request-authoritative" });
+
+  assert.equal(result.status, "succeeded");
+  assert.deepEqual(paths, ["/meta-authoritative"]);
+});
+
+test("startup recovery claims approved operations that have no execution row exactly once", async (t) => {
+  const { db } = fixture();
+  t.after(() => db.close());
+  addApprovedOperation(db, "operation-unclaimed", "configure_monthly_budget", {
+    monthly_budget: { amount: "42.42", currency: "USD" },
+  }, "K");
+  const execution = createExecutionService({
+    db, now: () => now, revalidate: async () => undefined,
+    readMedia: async () => { throw new Error("media must not be read"); }, cleanupOperationMedia: async () => 0,
+    meta: { request: async () => { throw new Error("local budget must not call Meta"); } },
+  });
+
+  const first = await execution.reconcile({ actor: "system:recovery", requestId: "startup-recovery" });
+  const second = await execution.reconcile({ actor: "system:recovery", requestId: "startup-recovery-replay" });
+
+  assert.equal(first.some(({ operation_id, status }) => operation_id === "operation-unclaimed" && status === "succeeded"), true);
+  assert.equal(second.some(({ operation_id }) => operation_id === "operation-unclaimed"), false);
+  assert.equal(db.prepare("SELECT count(*) AS count FROM operation_executions WHERE operation_id = 'operation-unclaimed'").get()!.count, 1);
+  assert.equal(db.prepare("SELECT correlation_id FROM operation_executions WHERE operation_id = 'operation-unclaimed'").get()!.correlation_id, "request-operation-unclaimed");
+  assert.equal(db.prepare("SELECT amount_minor FROM budgets WHERE client_id = 'client-1' AND ad_account_id = 'act_1'").get()!.amount_minor, 4242);
+});
+
+test("startup recovery leaves retryable target revalidation pending for a later retry", async (t) => {
+  const { db } = fixture();
+  t.after(() => db.close());
+  const execution = createExecutionService({
+    db, now: () => now, revalidate: async () => { throw new MetaError("upstream", "upstream_error", 503, undefined, true); },
+    readMedia: async () => { throw new Error("media must not be read"); }, cleanupOperationMedia: async () => { throw new Error("media must not be cleaned"); },
+    meta: { request: async () => { throw new Error("Meta write must not run"); } },
+  });
+
+  const recovered = await execution.reconcile({ actor: "system:recovery", requestId: "request-transient-recovery" });
+  assert.equal(recovered.find(({ operation_id }) => operation_id === "operation-1")!.status, "pending");
+  assert.equal(db.prepare("SELECT status FROM operations WHERE id = 'operation-1'").get()!.status, "pending");
+  assert.equal(db.prepare("SELECT count(*) AS count FROM operation_executions WHERE operation_id = 'operation-1'").get()!.count, 0);
+});
+
 test("reconciles a restart from persisted successful bundle steps without repeating writes", async (t) => {
   const { db } = fixture();
   t.after(() => db.close());
@@ -693,11 +758,14 @@ test("reconciles a committed local budget step after a crash before terminal out
   });
   const result = await restarted.reconcile({ actor: "system:recovery", requestId: "request-local-recovery" });
 
-  assert.equal(result[0]!.status, "succeeded");
+  assert.equal(result.find(({ operation_id }) => operation_id === "operation-local-crash")!.status, "succeeded");
   assert.equal(db.prepare("SELECT count(*) AS count FROM operation_steps WHERE operation_id = 'operation-local-crash'").get()!.count, 1);
   assert.equal(db.prepare("SELECT amount_minor FROM budgets WHERE client_id = 'client-1' AND ad_account_id = 'act_1'").get()!.amount_minor, 7777);
-  assert.deepEqual(db.prepare(`SELECT DISTINCT correlation_id FROM audit_log
-    WHERE logical_operation IN ('execution_step_intent', 'execution_step_outcome', 'execution_result')`).all().map(({ correlation_id }) => String(correlation_id)), ["request-local-crash"]);
+  assert.deepEqual(db.prepare(`SELECT DISTINCT a.correlation_id FROM audit_log a
+    JOIN operation_execution_audit_links l ON l.audit_id = a.id
+    WHERE l.operation_id = 'operation-local-crash'
+      AND a.logical_operation IN ('execution_step_intent', 'execution_step_outcome', 'execution_result')`).all()
+    .map(({ correlation_id }) => String(correlation_id)), ["request-local-crash"]);
 });
 
 test("pauses an ambiguous write across restart and never dispatches it again", async (t) => {
@@ -742,6 +810,27 @@ test("pauses an ambiguous write across restart and never dispatches it again", a
     WHERE logical_operation = 'execution_reconciliation_required' AND correlation_id = 'request-ambiguous'`).get()!.count, 1);
 });
 
+test("returns a newly recovered reconciliation-required execution only once", async (t) => {
+  const { db } = fixture();
+  t.after(() => db.close());
+  let calls = 0;
+  const execution = createExecutionService({
+    db, now: () => now, revalidate: async () => undefined,
+    readMedia: async () => ({ contentType: "image/png" as const, bytes: mediaBytes }),
+    cleanupOperationMedia: async () => 0,
+    meta: { request: async () => {
+      calls += 1;
+      if (calls === 1) return { data: { images: { upload: { hash: "image-hash-1" } } }, rate: {} };
+      throw new MetaError("timeout", "timeout");
+    } },
+  });
+
+  const reconciled = await execution.reconcile({ actor: "system:recovery", requestId: "request-recovery" });
+
+  assert.equal(reconciled.filter(({ operation_id }) => operation_id === "operation-1").length, 1);
+  assert.equal(reconciled.find(({ operation_id }) => operation_id === "operation-1")!.result?.status, "reconciliation_required");
+});
+
 test("marks an approved operation stale when execution-time revalidation changes after claim", async (t) => {
   const { db } = fixture();
   t.after(() => db.close());
@@ -754,7 +843,7 @@ test("marks an approved operation stale when execution-time revalidation changes
       checks += 1;
       if (checks === 2) {
         db.prepare("UPDATE scope_mappings SET active = 0 WHERE client_id = 'client-1' AND ad_account_id = 'act_1'").run();
-        throw new Error("authority changed");
+        throw new OperationError("authority changed", 409, "operation_stale");
       }
     },
     readMedia: async () => ({ contentType: "image/png" as const, bytes: mediaBytes }),
@@ -769,6 +858,67 @@ test("marks an approved operation stale when execution-time revalidation changes
   assert.equal(dispatched, false);
   assert.equal(cleanupStatus, "invalid");
   assert.equal(db.prepare("SELECT status FROM operation_executions WHERE operation_id = 'operation-1'").get()!.status, "failed");
+});
+
+test("retryable revalidation after claim resumes safely before any Meta write", async (t) => {
+  const { db } = fixture();
+  t.after(() => db.close());
+  let checks = 0;
+  let writes = 0;
+  const responses = [
+    { images: { upload: { hash: "image-hash-1" } } }, { id: "campaign-1" }, { id: "adset-1" }, { id: "creative-1" }, { id: "ad-1" },
+  ];
+  const execution = createExecutionService({
+    db, now: () => now, revalidate: async () => {
+      checks += 1;
+      if (checks === 2) throw new MetaError("limited", "meta_4", 400, 9, true);
+    },
+    readMedia: async () => ({ contentType: "image/png" as const, bytes: mediaBytes }), cleanupOperationMedia: async () => 0,
+    meta: { request: async () => ({ data: responses[writes++]!, rate: {} }) },
+  });
+
+  await assert.rejects(execution.execute({ operationId: "operation-1", actor: "discord:owner", requestId: "request-transient-execution" }), MetaError);
+  assert.equal(db.prepare("SELECT status FROM operations WHERE id = 'operation-1'").get()!.status, "executing");
+  assert.equal(db.prepare("SELECT count(*) AS count FROM operation_executions WHERE operation_id = 'operation-1'").get()!.count, 1);
+  assert.equal(db.prepare("SELECT count(*) AS count FROM operation_steps WHERE operation_id = 'operation-1'").get()!.count, 0);
+  assert.equal(writes, 0);
+
+  const retried = await execution.execute({ operationId: "operation-1", actor: "discord:owner", requestId: "request-transient-execution-retry" });
+  assert.equal(retried.status, "succeeded");
+  assert.equal(writes, 5);
+});
+
+test("startup recovery retries a claimed zero-step execution after upstream revalidation recovers", async (t) => {
+  const { db } = fixture();
+  t.after(() => db.close());
+  addApprovedOperation(db, "operation-recovery-revalidation", "configure_monthly_budget", {
+    monthly_budget: { amount: "54.32", currency: "USD" },
+  }, "L");
+  const hash = String(db.prepare("SELECT payload_hash FROM operations WHERE id = 'operation-recovery-revalidation'").get()!.payload_hash);
+  db.prepare(`INSERT INTO operation_executions
+    (id, operation_id, decision_id, payload_hash, status, claimed_at, correlation_id)
+    VALUES ('execution-recovery-revalidation', 'operation-recovery-revalidation', 'decision-operation-recovery-revalidation', ?, 'running', ?, 'request-recovery-revalidation')`)
+    .run(hash, now.toISOString());
+  db.prepare("UPDATE operations SET status = 'executing' WHERE id = 'operation-recovery-revalidation'").run();
+  let failedOnce = false;
+  const execution = createExecutionService({
+    db, now: () => now, revalidate: async ({ operationId }) => {
+      if (operationId === "operation-recovery-revalidation" && !failedOnce) {
+        failedOnce = true;
+        throw new MetaError("invalid response", "invalid_response", 404);
+      }
+    },
+    readMedia: async () => { throw new Error("media must not be read"); }, cleanupOperationMedia: async () => 0,
+    meta: { request: async () => { throw new Error("local budget must not call Meta"); } },
+  });
+
+  const failed = await execution.reconcile({ actor: "system:recovery", requestId: "startup-recovery" });
+  assert.equal(failed.find(({ operation_id }) => operation_id === "operation-recovery-revalidation")!.status, "executing");
+  assert.equal(db.prepare("SELECT count(*) AS count FROM operation_steps WHERE operation_id = 'operation-recovery-revalidation'").get()!.count, 0);
+
+  const retried = await execution.reconcile({ actor: "system:recovery", requestId: "startup-recovery-retry" });
+  assert.equal(retried.find(({ operation_id }) => operation_id === "operation-recovery-revalidation")!.status, "succeeded");
+  assert.equal(db.prepare("SELECT amount_minor FROM budgets WHERE client_id = 'client-1' AND ad_account_id = 'act_1'").get()!.amount_minor, 5432);
 });
 
 test("cleans bound media after a definitive campaign failure and keeps ambiguous media", async (t) => {

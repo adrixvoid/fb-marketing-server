@@ -25,6 +25,7 @@ Exactly one configured channel-scoped owner MUST approve or reject through deter
 ### Requirement: Exact expiry and revalidation
 
 A pending operation MUST be valid only while `now < created_at + 12 hours`; equality or later MUST be expired. Immediately before execution, the service MUST revalidate target, budget, effective Meta authority, credential generation, and each bound media hash against the immutable payload.
+Only a semantic target mismatch or not-found result MUST make the operation stale. Retryable, transient, and upstream revalidation failures during approval, execution, or startup recovery MUST preserve the prior lifecycle state for a later safe retry and retain supported HTTP status and `Retry-After` semantics.
 
 #### Scenario: Before expiry
 
@@ -43,6 +44,12 @@ A pending operation MUST be valid only while `now < created_at + 12 hours`; equa
 - GIVEN the operation's integration generation differs from the active validated generation
 - WHEN approval is processed
 - THEN the operation MUST become non-executable without credential substitution
+
+#### Scenario: Transient revalidation failure
+
+- GIVEN target revalidation is rate-limited or temporarily unavailable
+- WHEN approval, execution, or startup recovery runs
+- THEN the operation MUST NOT become stale and no mutation MUST be dispatched
 
 ### Requirement: At-most-once execution and recovery
 

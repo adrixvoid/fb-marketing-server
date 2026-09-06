@@ -1,7 +1,7 @@
 {
   "id": "fb-marketing-server",
   "name": "Meta Ads Local Gateway",
-  "description": "Curated Meta Ads tools and deterministic owner commands for the loopback gateway.",
+  "description": "Curated Meta Ads tools and deterministic owner commands, including same-message media staging, for the loopback gateway.",
   "version": "0.1.0",
   "contracts": {
     "tools": [
@@ -11,7 +11,6 @@
       "list_campaigns",
       "query_insights",
       "budget_summary",
-      "upload_chat_media",
       "propose_operation",
       "get_operation"
     ]

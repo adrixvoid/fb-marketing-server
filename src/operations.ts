@@ -4,7 +4,7 @@ import type { Context, HandlerMap } from "openapi-backend";
 import type { ContractResponse } from "./contract.js";
 import type { components } from "./generated/openapi.js";
 import { appendAudit, transaction } from "./db.js";
-import { MetaError, type MetaRequest } from "./meta-client.js";
+import { isMetaRateLimit, MetaError, safeMetaRetryAfter, type MetaRequest } from "./meta-client.js";
 import { resolveScope, type ResolvedScope } from "./scope.js";
 import { requestId } from "./request-id.js";
 
@@ -35,7 +35,7 @@ interface OperationsOptions {
   db: DatabaseSync;
   hashMediaFile(storageName: string): Promise<string>;
   capabilities(input: { actor: string; requestId: string; clientId: string; adAccountId: string }): Promise<CapabilitySnapshot>;
-  validateTarget(input: { actor: string; requestId: string; scope: ResolvedScope; objectType: "campaign" | "ad_set" | "ad"; objectId: string }): Promise<boolean>;
+  validateTarget(input: { actor: string; requestId: string; scope: ResolvedScope; objectType: "campaign" | "ad_set" | "ad"; objectId: string }): Promise<string | undefined>;
   now?: () => Date;
 }
 
@@ -90,6 +90,7 @@ interface OperationRow {
   generation_id: string;
   payload_json: string;
   payload_hash: string;
+  derived_json: string;
   result_json: string | null;
   created_at: string;
   expires_at: string;
@@ -315,7 +316,7 @@ export function createOperationsService({ db, hashMediaFile, capabilities, valid
     };
   }
 
-  async function otherSemantics(input: ProposeInput, scope: ResolvedScope): Promise<void> {
+  async function otherSemantics(input: ProposeInput, scope: ResolvedScope): Promise<Record<string, unknown>> {
     if (input.request.type === "update_object") {
       const payload = input.request.payload;
       if (!(new Set(["campaign", "ad_set", "ad"])).has(payload.object_type)) throw new OperationError("Object type is unsupported", 422, "operation_semantics_invalid");
@@ -323,18 +324,23 @@ export function createOperationsService({ db, hashMediaFile, capabilities, valid
       if (payload.object_type === "ad_set" && invalidSchedule(payload.changes.start_time, payload.changes.end_time)) {
         throw new OperationError("Ad Set schedule is invalid", 422, "operation_semantics_invalid");
       }
-      if (!await validateTarget({ actor: input.actor, requestId: input.requestId, scope, objectType: payload.object_type, objectId: payload.object_id })) {
+      const objectId = await validateTarget({ actor: input.actor, requestId: input.requestId, scope, objectType: payload.object_type, objectId: payload.object_id });
+      if (objectId === undefined) {
         throw new OperationError("Target is unavailable", 422, "asset_incompatible");
       }
+      return { target: { object_type: payload.object_type, object_id: objectId, ad_account_id: scope.adAccountId } };
     } else if (input.request.type === "change_delivery") {
       const type = ({ Campaign: "campaign", AdSet: "ad_set", Ad: "ad" } as const)[input.request.payload.object_type];
       if (type === undefined) throw new OperationError("Creative delivery transitions are forbidden", 422, "operation_semantics_invalid");
-      if (!await validateTarget({ actor: input.actor, requestId: input.requestId, scope, objectType: type, objectId: input.request.payload.object_id })) {
+      const objectId = await validateTarget({ actor: input.actor, requestId: input.requestId, scope, objectType: type, objectId: input.request.payload.object_id });
+      if (objectId === undefined) {
         throw new OperationError("Target is unavailable", 422, "asset_incompatible");
       }
+      return { target: { object_type: type, object_id: objectId, ad_account_id: scope.adAccountId } };
     } else if (input.request.type === "configure_monthly_budget") {
       moneyCurrency(scope, input.request.payload.monthly_budget);
     }
+    return {};
   }
 
   async function validateMedia(scope: ResolvedScope, bindings: Array<{ media_id: string; sha256: string }>, at: Date, status = "staged") {
@@ -370,7 +376,7 @@ export function createOperationsService({ db, hashMediaFile, capabilities, valid
     if (existing !== undefined) return { created: false, operation: operationExecutionView(db, operationFromRow(existing, scope)) };
     const at = now();
     const { derived, media } = await campaignSemantics(input, scope);
-    await otherSemantics(input, scope);
+    const mutationDerived = await otherSemantics(input, scope);
     const mediaRows = await validateMedia(scope, media, at);
     const operationId = randomUUID();
     const expiresAt = new Date(at.getTime() + TWELVE_HOURS_MS);
@@ -386,7 +392,7 @@ export function createOperationsService({ db, hashMediaFile, capabilities, valid
           (id, actor, client_id, ad_account_id, generation_id, operation_type, payload_json,
            payload_hash, derived_json, status, created_at, expires_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
-      `).run(operationId, input.actor, scope.clientId, scope.adAccountId, scope.generationId, input.request.type, payloadJson, payloadHash, canonicalPayload(derived), at.toISOString(), expiresAt.toISOString());
+      `).run(operationId, input.actor, scope.clientId, scope.adAccountId, scope.generationId, input.request.type, payloadJson, payloadHash, canonicalPayload({ ...derived, ...mutationDerived }), at.toISOString(), expiresAt.toISOString());
       db.prepare(`
         INSERT INTO operation_idempotency
           (actor, operation_type, client_id, ad_account_id, idempotency_key, payload_hash, operation_id, created_at)
@@ -435,7 +441,11 @@ export function createOperationsService({ db, hashMediaFile, capabilities, valid
           actor: input.actor,
           ...(scope === undefined ? {} : { clientId: scope.clientId, adAccountId: scope.adAccountId, generationId: scope.generationId }),
           operation: "propose_operation", correlationId: input.requestId, occurredAt: now().toISOString(), outcome: "failed",
-          evidence: { errorCode: error instanceof OperationError ? error.code : "operation_semantics_invalid" },
+          evidence: {
+            errorCode: error instanceof OperationError
+              ? error.code
+              : error instanceof MetaError ? isMetaRateLimit(error) ? "rate_limited" : "meta_error" : "operation_semantics_invalid",
+          },
         });
         if (existingBinding !== undefined) {
           db.prepare("INSERT INTO operation_audit_links (audit_id, operation_id, event_type) VALUES (?, ?, 'proposal')")
@@ -472,8 +482,11 @@ export function createOperationsService({ db, hashMediaFile, capabilities, valid
       payload: JSON.parse(row.payload_json),
     } as CreateOperationRequest;
     const proposalInput: ProposeInput = { actor: input.actor, requestId: input.requestId, idempotencyKey: "revalidation-only", request };
-    const { media } = await campaignSemantics(proposalInput, scope);
-    await otherSemantics(proposalInput, scope);
+    const { derived, media } = await campaignSemantics(proposalInput, scope);
+    const mutationDerived = await otherSemantics(proposalInput, scope);
+    if (canonicalPayload({ ...derived, ...mutationDerived }) !== canonicalPayload(JSON.parse(row.derived_json))) {
+      throw new OperationError("Operation target is stale", 409, "client_account_mismatch");
+    }
     const mediaRows = await validateMedia(scope, media, now(), "bound");
     const links = db.prepare("SELECT media_id, media_hash FROM operation_media WHERE operation_id = ? ORDER BY media_id").all(row.id);
     const expected = mediaRows.map(({ media_id, sha256: media_hash }) => ({ media_id, media_hash })).sort((a, b) => a.media_id.localeCompare(b.media_id));
@@ -573,6 +586,7 @@ function operationView(db: DatabaseSync, row: ExecutionOperationRow): Operation 
 }
 
 export function createExecutionService({ db, meta, revalidate, readMedia, cleanupOperationMedia, now = () => new Date(), testHooks = {} }: ExecutionOptions) {
+  const activeExecutions = new Set<string>();
   function provenResources(operationId: string): Array<{ type: string; id: string }> {
     return db.prepare(`SELECT CASE kind WHEN 'update_object' THEN 'object' WHEN 'change_delivery' THEN 'object'
         WHEN 'configure_monthly_budget' THEN 'budget' ELSE kind END AS type, external_id AS id FROM operation_steps
@@ -600,7 +614,11 @@ export function createExecutionService({ db, meta, revalidate, readMedia, cleanu
     return transaction(db, () => {
       const current = executionOperation(db, row.id);
       const existing = db.prepare("SELECT * FROM operation_executions WHERE operation_id = ?").get(row.id) as unknown as ExecutionRow | undefined;
-      if (existing !== undefined || current.status !== "pending") return undefined;
+      if (existing !== undefined) {
+        const steps = Number(db.prepare("SELECT count(*) AS count FROM operation_steps WHERE execution_id = ?").get(existing.id)!.count);
+        return existing.status === "running" && current.status === "executing" && steps === 0 ? existing : undefined;
+      }
+      if (current.status !== "pending") return undefined;
       assertIdentity(current);
       if (now().getTime() >= Date.parse(current.expires_at)) {
         db.prepare("UPDATE operations SET status = 'expired' WHERE id = ? AND status = 'pending'").run(current.id);
@@ -651,7 +669,8 @@ export function createExecutionService({ db, meta, revalidate, readMedia, cleanu
     try {
       await revalidate({ actor: input.actor, requestId: input.requestId, operationId: row.id });
       return true;
-    } catch {
+    } catch (error) {
+      if (!(error instanceof OperationError)) throw error;
       transaction(db, () => {
         db.prepare("UPDATE operations SET status = 'stale' WHERE id = ? AND status IN ('pending', 'executing')").run(row.id);
         if (execution !== undefined) linkExecutionAudit(row, execution, "failed", "operation_stale");
@@ -693,6 +712,7 @@ export function createExecutionService({ db, meta, revalidate, readMedia, cleanu
       const response = await meta.request({
         method: "POST", path, ...(form === undefined ? { body } : { form }), scope: { clientId: row.client_id, adAccountId: row.ad_account_id, generationId: row.generation_id },
         actor: input.actor, correlationId, operation: `execute_${kind}`,
+        executionStep: { executionId: execution.id, stepKey },
       });
       testHooks.afterMetaResponse?.(stepKey);
       const id = parse(response.data);
@@ -831,7 +851,9 @@ export function createExecutionService({ db, meta, revalidate, readMedia, cleanu
       }
     } else {
       const payload = JSON.parse(row.payload_json) as components["schemas"]["UpdateObjectPayload"] | components["schemas"]["ChangeDeliveryPayload"];
-      const objectId = String(payload.object_id);
+      const target = JSON.parse(row.derived_json) as { target?: { object_id?: unknown; ad_account_id?: unknown } };
+      const objectId = target.target?.object_id;
+      if (typeof objectId !== "string" || target.target?.ad_account_id !== row.ad_account_id) throw new Error("operation_stale");
       let body: Record<string, unknown>;
       if (row.operation_type === "change_delivery") {
         const delivery = payload as components["schemas"]["ChangeDeliveryPayload"];
@@ -863,25 +885,46 @@ export function createExecutionService({ db, meta, revalidate, readMedia, cleanu
       return operationView(db, row);
     }
     if (execution === undefined) return operationView(db, row);
-    if (row.operation_type === "create_campaign_bundle") {
-      try {
-        return await executeCampaign(row, execution, input);
-      } catch {
-        return operationView(db, row);
-      }
-    }
+    if (activeExecutions.has(execution.id)) return operationView(db, row);
+    activeExecutions.add(execution.id);
     try {
+      if (row.operation_type === "create_campaign_bundle") {
+        return await executeCampaign(row, execution, input);
+      }
       return await executeMutation(row, execution, input);
-    } catch {
+    } catch (error) {
+      const steps = Number(db.prepare("SELECT count(*) AS count FROM operation_steps WHERE execution_id = ?").get(execution.id)!.count);
+      if (error instanceof MetaError && steps === 0) throw error;
       return operationView(db, row);
+    } finally {
+      activeExecutions.delete(execution.id);
     }
   }
 
   async function reconcile(input: { actor: string; requestId: string }): Promise<Operation[]> {
+    const unclaimed = db.prepare(`SELECT o.id, d.owner_identity, d.correlation_id FROM operations o
+      JOIN approval_decisions d ON d.operation_id = o.id
+      LEFT JOIN operation_executions e ON e.operation_id = o.id
+      WHERE o.status = 'pending' AND d.decision = 'approved' AND e.id IS NULL
+      ORDER BY d.decided_at, d.id`).all() as Array<{ id: string; owner_identity: string; correlation_id: string }>;
+    const recovered = [] as Operation[];
+    for (const operation of unclaimed) {
+      try {
+        recovered.push(await execute({
+          operationId: operation.id,
+          actor: operation.owner_identity,
+          requestId: operation.correlation_id,
+        }));
+      } catch {
+        recovered.push(operationView(db, executionOperation(db, operation.id)));
+      }
+    }
     const executions = db.prepare(`SELECT * FROM operation_executions
       WHERE status IN ('running', 'reconciliation_required') ORDER BY claimed_at, id`).all() as unknown as ExecutionRow[];
-    const operations: Operation[] = [];
+    const operations: Operation[] = [...recovered];
+    const recoveredIds = new Set(recovered.map(({ operation_id }) => operation_id));
     for (const execution of executions) {
+      if (recoveredIds.has(execution.operation_id)) continue;
       const row = executionOperation(db, execution.operation_id);
       const unresolved = db.prepare(`SELECT status FROM operation_steps
         WHERE execution_id = ? AND status IN ('intent', 'reconciliation_required') LIMIT 1`)
@@ -941,6 +984,24 @@ function operationProblem(id: string, error: OperationError, scope?: { client_id
   };
 }
 
+function operationMetaProblem(id: string, error: MetaError): ContractResponse {
+  const rateLimited = isMetaRateLimit(error);
+  const retryAfter = safeMetaRetryAfter(error);
+  return {
+    statusCode: rateLimited ? 429 : 502,
+    mediaType: "application/problem+json",
+    headers: { "x-request-id": id, ...(rateLimited && retryAfter !== undefined ? { "retry-after": String(retryAfter) } : {}) },
+    body: {
+      type: `urn:fb-marketing-server:${rateLimited ? "rate_limited" : "meta_error"}`,
+      title: rateLimited ? "Rate limited" : "Upstream error",
+      status: rateLimited ? 429 : 502,
+      code: rateLimited ? "rate_limited" : "meta_error",
+      detail: rateLimited ? "Rate limited" : "Upstream error",
+      request_id: id,
+    },
+  };
+}
+
 export function createOperationHandlers(service: OperationsService, actor: string): HandlerMap {
   return {
     createOperation: async (context: Context) => {
@@ -961,6 +1022,7 @@ export function createOperationHandlers(service: OperationsService, actor: strin
         } satisfies ContractResponse;
       } catch (error) {
         if (error instanceof OperationError) return operationProblem(id, error, supplied(request));
+        if (error instanceof MetaError) return operationMetaProblem(id, error);
         throw error;
       }
     },
