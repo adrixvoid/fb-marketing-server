@@ -2,6 +2,8 @@
 
 Private, loopback-only Meta Ads service intended for OpenClaw. The server exposes the OpenAPI contract in [`openapi.yaml`](openapi.yaml), stores local state in SQLite, and keeps runtime keys in macOS Keychain.
 
+> **OpenClaw setup:** this is not an MCP server or a production deployment. It is a native OpenClaw `2026.9.2` plugin that calls this service on `127.0.0.1`. Follow the canonical [local OpenClaw setup guide](docs/openclaw-local-setup.md).
+
 > **Current scope:** the service, OpenClaw plugin, LaunchAgent installer, protected database operations, and fixture-tested phased migration validator are implemented. The real pilot, cutover, observation, rollback exercise, retirement, and Meta portfolio/app provisioning remain operator-run work.
 
 ## Prerequisites
@@ -29,18 +31,14 @@ npm --version  # 11.17.0
 
 ```bash
 npm ci
-
-# One-time: create both runtime values without putting either value in argv.
-openssl rand -hex 32 | security add-generic-password \
-  -s fb-marketing-server -a openclaw-service-token -w
-printf '%s\n' 'discord:your-user-id' | security add-generic-password \
-  -s fb-marketing-server -a openclaw-owner-identity -w
-
-npm run service:install
-npm run service:status
+npm run build
 ```
 
-The service listens on `http://127.0.0.1:3000`. Keep it private; the host is fixed to loopback.
+Continue with the [local OpenClaw setup guide](docs/openclaw-local-setup.md) to configure Keychain safely, start in the foreground, verify health, and only then enable optional LaunchAgent persistence. The service listens on `http://127.0.0.1:3000`; the host is fixed to loopback.
+
+### Optional LaunchAgent
+
+The LaunchAgent is a per-user macOS service that starts the local gateway automatically after login, without keeping a terminal open. Its plist lives in `~/Library/LaunchAgents/`, application data in `~/Library/Application Support/fb-marketing-server/`, and private logs in `~/Library/Logs/fb-marketing-server/`; this is local persistence, not a production deployment.
 
 ## Configuration
 
@@ -76,7 +74,7 @@ Expected shape:
 {"status":"ok","time":"<ISO-8601 timestamp>"}
 ```
 
-Run the full project checks before changing or deploying the service:
+Run the full project checks before changing or operating the service:
 
 ```bash
 npm run generate:check
@@ -104,25 +102,7 @@ npm run build
 
 ## Install the OpenClaw plugin
 
-Build and pack from a clean checkout, then install the produced archive through the OpenClaw CLI:
-
-```bash
-cd packages/openclaw-plugin
-npm ci
-npm run build
-npm pack --pack-destination /absolute/private/staging-directory
-openclaw plugins install /absolute/private/staging-directory/fb-marketing-server-openclaw-plugin-0.1.0.tgz
-```
-
-Configure the plugin with the strict fields in `openclaw.plugin.json`: loopback `baseUrl`, Keychain service/account references, trusted `attachmentRoots`, and optional timeout. Configure exactly one channel-scoped owner separately from model tools:
-
-```json5
-{
-  commands: { ownerAllowFrom: ["discord:your-user-id"] }
-}
-```
-
-The plugin is checked against `openclaw@2026.9.2` and imports `mergeInboundPathRoots` from `openclaw/plugin-sdk/channel-inbound`.
+Use the [local OpenClaw setup guide](docs/openclaw-local-setup.md) for the verified `npm-pack:` install flow, strict plugin configuration, owner allowlist, tool registration checks, trusted attachments, and optional LaunchAgent persistence.
 
 ## Troubleshooting
 

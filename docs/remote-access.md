@@ -4,7 +4,7 @@ Users interact only through OpenClaw outbound chat channels. `fb-marketing-serve
 
 ## Install the service
 
-Production startup reads `openclaw-service-token` and `openclaw-owner-identity` from the `fb-marketing-server` login Keychain. The LaunchAgent contains no secrets.
+Compiled local startup reads `openclaw-service-token` and `openclaw-owner-identity` from the `fb-marketing-server` login Keychain. The LaunchAgent contains no secrets.
 
 ```bash
 npm run service:install

@@ -140,7 +140,7 @@ test("SIGTERM and SIGINT close the application once", async () => {
 
 test("operations docs keep bearer off argv and expose users only through outbound chat", async () => {
   const read = (path: string) => readFile(new URL(`../${path}`, import.meta.url), "utf8");
-  const docs = `${await read("README.md")}\n${await read("docs/remote-access.md")}`;
+  const docs = `${await read("README.md")}\n${await read("docs/remote-access.md")}\n${await read("docs/openclaw-local-setup.md")}`;
   assert.doesNotMatch(docs, /Tailscale Serve|Tailscale Funnel|ssh -N|-L \d+|gateway\.tailscale|API forwarding/i);
   assert.match(docs, /OpenClaw outbound chat channels/i);
   assert.match(docs, /SERVICE_TOKEN=.*security find-generic-password/);
